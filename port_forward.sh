@@ -308,6 +308,19 @@ case $MAIN_ACTION in
             1)
                 echo -e "${YELLOW}停止 iptables DNAT 规则...${NC}"
                 IPTABLES_CMD=$(get_iptables_cmd)
+                
+                # 首先备份当前规则到固定位置
+                IPTABLES_RUNNING_BACKUP="/root/.port_forward_iptables_running.txt"
+                if $IPTABLES_CMD -t nat -L PREROUTING -n 2>/dev/null | grep -q DNAT; then
+                    echo -e "${YELLOW}备份当前 iptables 规则...${NC}"
+                    if [[ "$IPTABLES_CMD" == "iptables-legacy" ]]; then
+                        iptables-legacy-save > "$IPTABLES_RUNNING_BACKUP" 2>/dev/null || true
+                    else
+                        iptables-save > "$IPTABLES_RUNNING_BACKUP" 2>/dev/null || true
+                    fi
+                    echo -e "${GREEN}规则已备份到: $IPTABLES_RUNNING_BACKUP${NC}"
+                fi
+                
                 # 清理DNAT规则
                 $IPTABLES_CMD -t nat -S 2>/dev/null | grep "\-A.*DNAT" | sed 's/-A/-D/' | while read rule; do
                     $IPTABLES_CMD -t nat $rule 2>/dev/null || true
@@ -353,8 +366,16 @@ case $MAIN_ACTION in
                 systemctl stop rinetd 2>/dev/null || true
                 systemctl stop nginx 2>/dev/null || true
                 
-                # 清理iptables DNAT规则
+                # 备份并清理iptables DNAT规则
                 IPTABLES_CMD=$(get_iptables_cmd)
+                IPTABLES_RUNNING_BACKUP="/root/.port_forward_iptables_running.txt"
+                if $IPTABLES_CMD -t nat -L PREROUTING -n 2>/dev/null | grep -q DNAT; then
+                    if [[ "$IPTABLES_CMD" == "iptables-legacy" ]]; then
+                        iptables-legacy-save > "$IPTABLES_RUNNING_BACKUP" 2>/dev/null || true
+                    else
+                        iptables-save > "$IPTABLES_RUNNING_BACKUP" 2>/dev/null || true
+                    fi
+                fi
                 $IPTABLES_CMD -t nat -S 2>/dev/null | grep "\-A.*DNAT" | sed 's/-A/-D/' | while read rule; do
                     $IPTABLES_CMD -t nat $rule 2>/dev/null || true
                 done
@@ -596,13 +617,48 @@ case $MAIN_ACTION in
         case $START_CHOICE in
             1)
                 echo -e "${YELLOW}启动 iptables DNAT 规则...${NC}"
-                # 检查备份目录中是否有最近的iptables配置
-                BACKUP_BASE_DIR="/root/.port_forward_backups"
-                if [ -d "$BACKUP_BASE_DIR" ]; then
+                IPTABLES_CMD=$(get_iptables_cmd)
+                IPTABLES_RUNNING_BACKUP="/root/.port_forward_iptables_running.txt"
+                
+                # 优先从运行时备份恢复
+                if [ -f "$IPTABLES_RUNNING_BACKUP" ]; then
+                    echo -e "${YELLOW}从运行时备份恢复规则...${NC}"
+                    
+                    # 先清理现有规则
+                    $IPTABLES_CMD -t nat -S 2>/dev/null | grep "\-A.*DNAT" | sed 's/-A/-D/' | while read rule; do
+                        $IPTABLES_CMD -t nat $rule 2>/dev/null || true
+                    done
+                    $IPTABLES_CMD -t nat -S 2>/dev/null | grep "\-A.*MASQUERADE" | sed 's/-A/-D/' | while read rule; do
+                        $IPTABLES_CMD -t nat $rule 2>/dev/null || true
+                    done
+                    
+                    # 使用正确的restore命令
+                    if [[ "$IPTABLES_CMD" == "iptables-legacy" ]]; then
+                        RESTORE_CMD="iptables-legacy-restore"
+                    else
+                        RESTORE_CMD="iptables-restore"
+                    fi
+                    
+                    if $RESTORE_CMD < "$IPTABLES_RUNNING_BACKUP" 2>/dev/null; then
+                        echo -e "${GREEN}iptables DNAT 规则已恢复${NC}"
+                        # 确保IP转发已启用
+                        echo 1 > /proc/sys/net/ipv4/ip_forward
+                        # 验证规则
+                        sleep 1
+                        if $IPTABLES_CMD -t nat -L PREROUTING -n 2>/dev/null | grep -q DNAT; then
+                            echo -e "${GREEN}✅ 规则验证成功，转发已生效${NC}"
+                        else
+                            echo -e "${YELLOW}⚠️  规则恢复但未检测到DNAT，请检查配置${NC}"
+                        fi
+                    else
+                        echo -e "${RED}规则恢复失败${NC}"
+                    fi
+                # 如果运行时备份不存在，尝试从配置备份恢复
+                elif [ -d "/root/.port_forward_backups" ]; then
+                    BACKUP_BASE_DIR="/root/.port_forward_backups"
                     LATEST_BACKUP=$(ls -dt "$BACKUP_BASE_DIR"/* 2>/dev/null | head -1)
                     if [ -n "$LATEST_BACKUP" ] && [ -f "$LATEST_BACKUP/iptables_current.txt" ]; then
-                        echo -e "${YELLOW}找到备份配置，正在恢复...${NC}"
-                        IPTABLES_CMD=$(get_iptables_cmd)
+                        echo -e "${YELLOW}从配置备份恢复规则...${NC}"
                         
                         # 先清理现有规则
                         $IPTABLES_CMD -t nat -S 2>/dev/null | grep "\-A.*DNAT" | sed 's/-A/-D/' | while read rule; do
@@ -623,6 +679,8 @@ case $MAIN_ACTION in
                             echo -e "${GREEN}iptables DNAT 规则已恢复${NC}"
                             # 确保IP转发已启用
                             echo 1 > /proc/sys/net/ipv4/ip_forward
+                            # 同时保存为运行时备份
+                            cp "$LATEST_BACKUP/iptables_current.txt" "$IPTABLES_RUNNING_BACKUP" 2>/dev/null || true
                             # 验证规则
                             sleep 1
                             if $IPTABLES_CMD -t nat -L PREROUTING -n 2>/dev/null | grep -q DNAT; then
@@ -637,7 +695,7 @@ case $MAIN_ACTION in
                         echo -e "${RED}未找到iptables备份配置，请先配置服务${NC}"
                     fi
                 else
-                    echo -e "${RED}未找到备份目录，请先配置服务${NC}"
+                    echo -e "${RED}未找到备份文件，请先配置服务${NC}"
                 fi
                 ;;
             2)
@@ -699,11 +757,34 @@ case $MAIN_ACTION in
                 STARTED_COUNT=0
                 
                 # iptables DNAT
-                BACKUP_BASE_DIR="/root/.port_forward_backups"
-                if [ -d "$BACKUP_BASE_DIR" ]; then
+                IPTABLES_CMD=$(get_iptables_cmd)
+                IPTABLES_RUNNING_BACKUP="/root/.port_forward_iptables_running.txt"
+                
+                # 优先从运行时备份恢复
+                if [ -f "$IPTABLES_RUNNING_BACKUP" ]; then
+                    # 先清理
+                    $IPTABLES_CMD -t nat -S 2>/dev/null | grep "\-A.*DNAT" | sed 's/-A/-D/' | while read rule; do
+                        $IPTABLES_CMD -t nat $rule 2>/dev/null || true
+                    done
+                    $IPTABLES_CMD -t nat -S 2>/dev/null | grep "\-A.*MASQUERADE" | sed 's/-A/-D/' | while read rule; do
+                        $IPTABLES_CMD -t nat $rule 2>/dev/null || true
+                    done
+                    # 恢复
+                    if [[ "$IPTABLES_CMD" == "iptables-legacy" ]]; then
+                        RESTORE_CMD="iptables-legacy-restore"
+                    else
+                        RESTORE_CMD="iptables-restore"
+                    fi
+                    if $RESTORE_CMD < "$IPTABLES_RUNNING_BACKUP" 2>/dev/null; then
+                        echo -e "${GREEN}✓ iptables DNAT 规则已恢复${NC}"
+                        echo 1 > /proc/sys/net/ipv4/ip_forward
+                        STARTED_COUNT=$((STARTED_COUNT+1))
+                    fi
+                # 如果没有运行时备份，尝试从配置备份恢复
+                elif [ -d "/root/.port_forward_backups" ]; then
+                    BACKUP_BASE_DIR="/root/.port_forward_backups"
                     LATEST_BACKUP=$(ls -dt "$BACKUP_BASE_DIR"/* 2>/dev/null | head -1)
                     if [ -n "$LATEST_BACKUP" ] && [ -f "$LATEST_BACKUP/iptables_current.txt" ]; then
-                        IPTABLES_CMD=$(get_iptables_cmd)
                         # 先清理
                         $IPTABLES_CMD -t nat -S 2>/dev/null | grep "\-A.*DNAT" | sed 's/-A/-D/' | while read rule; do
                             $IPTABLES_CMD -t nat $rule 2>/dev/null || true
@@ -720,6 +801,8 @@ case $MAIN_ACTION in
                         if $RESTORE_CMD < "$LATEST_BACKUP/iptables_current.txt" 2>/dev/null; then
                             echo -e "${GREEN}✓ iptables DNAT 规则已恢复${NC}"
                             echo 1 > /proc/sys/net/ipv4/ip_forward
+                            # 同时保存为运行时备份
+                            cp "$LATEST_BACKUP/iptables_current.txt" "$IPTABLES_RUNNING_BACKUP" 2>/dev/null || true
                             STARTED_COUNT=$((STARTED_COUNT+1))
                         fi
                     fi
