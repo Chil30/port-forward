@@ -632,26 +632,30 @@ case $MAIN_ACTION in
                         $IPTABLES_CMD -t nat $rule 2>/dev/null || true
                     done
                     
-                    # 使用正确的restore命令
+                    # 使用正确的restore命令，添加 --noflush 参数
                     if [[ "$IPTABLES_CMD" == "iptables-legacy" ]]; then
                         RESTORE_CMD="iptables-legacy-restore"
                     else
                         RESTORE_CMD="iptables-restore"
                     fi
                     
-                    if $RESTORE_CMD < "$IPTABLES_RUNNING_BACKUP" 2>/dev/null; then
+                    # 使用 --noflush 参数保留其他规则
+                    if $RESTORE_CMD --noflush < "$IPTABLES_RUNNING_BACKUP" 2>/dev/null; then
                         echo -e "${GREEN}iptables DNAT 规则已恢复${NC}"
                         # 确保IP转发已启用
                         echo 1 > /proc/sys/net/ipv4/ip_forward
                         # 验证规则
                         sleep 1
                         if $IPTABLES_CMD -t nat -L PREROUTING -n 2>/dev/null | grep -q DNAT; then
-                            echo -e "${GREEN}✅ 规则验证成功，转发已生效${NC}"
+                            DNAT_COUNT=$($IPTABLES_CMD -t nat -L PREROUTING -n 2>/dev/null | grep DNAT | wc -l)
+                            echo -e "${GREEN}✅ 规则验证成功，检测到 $DNAT_COUNT 条DNAT规则${NC}"
                         else
-                            echo -e "${YELLOW}⚠️  规则恢复但未检测到DNAT，请检查配置${NC}"
+                            echo -e "${YELLOW}⚠️  规则恢复但未检测到DNAT，尝试手动验证${NC}"
+                            $IPTABLES_CMD -t nat -L PREROUTING -n -v 2>/dev/null | head -20
                         fi
                     else
-                        echo -e "${RED}规则恢复失败${NC}"
+                        echo -e "${RED}规则恢复失败，尝试查看错误${NC}"
+                        $RESTORE_CMD --noflush < "$IPTABLES_RUNNING_BACKUP" 2>&1 | head -10
                     fi
                 # 如果运行时备份不存在，尝试从配置备份恢复
                 elif [ -d "/root/.port_forward_backups" ]; then
@@ -668,14 +672,15 @@ case $MAIN_ACTION in
                             $IPTABLES_CMD -t nat $rule 2>/dev/null || true
                         done
                         
-                        # 使用正确的restore命令
+                        # 使用正确的restore命令，添加 --noflush 参数
                         if [[ "$IPTABLES_CMD" == "iptables-legacy" ]]; then
                             RESTORE_CMD="iptables-legacy-restore"
                         else
                             RESTORE_CMD="iptables-restore"
                         fi
                         
-                        if $RESTORE_CMD < "$LATEST_BACKUP/iptables_current.txt" 2>/dev/null; then
+                        # 使用 --noflush 参数保留其他规则
+                        if $RESTORE_CMD --noflush < "$LATEST_BACKUP/iptables_current.txt" 2>/dev/null; then
                             echo -e "${GREEN}iptables DNAT 规则已恢复${NC}"
                             # 确保IP转发已启用
                             echo 1 > /proc/sys/net/ipv4/ip_forward
@@ -684,12 +689,15 @@ case $MAIN_ACTION in
                             # 验证规则
                             sleep 1
                             if $IPTABLES_CMD -t nat -L PREROUTING -n 2>/dev/null | grep -q DNAT; then
-                                echo -e "${GREEN}✅ 规则验证成功，转发已生效${NC}"
+                                DNAT_COUNT=$($IPTABLES_CMD -t nat -L PREROUTING -n 2>/dev/null | grep DNAT | wc -l)
+                                echo -e "${GREEN}✅ 规则验证成功，检测到 $DNAT_COUNT 条DNAT规则${NC}"
                             else
-                                echo -e "${YELLOW}⚠️  规则恢复但未检测到DNAT，请检查配置${NC}"
+                                echo -e "${YELLOW}⚠️  规则恢复但未检测到DNAT，尝试手动验证${NC}"
+                                $IPTABLES_CMD -t nat -L PREROUTING -n -v 2>/dev/null | head -20
                             fi
                         else
-                            echo -e "${RED}规则恢复失败，请重新配置${NC}"
+                            echo -e "${RED}规则恢复失败，尝试查看错误${NC}"
+                            $RESTORE_CMD --noflush < "$LATEST_BACKUP/iptables_current.txt" 2>&1 | head -10
                         fi
                     else
                         echo -e "${RED}未找到iptables备份配置，请先配置服务${NC}"
@@ -775,7 +783,7 @@ case $MAIN_ACTION in
                     else
                         RESTORE_CMD="iptables-restore"
                     fi
-                    if $RESTORE_CMD < "$IPTABLES_RUNNING_BACKUP" 2>/dev/null; then
+                    if $RESTORE_CMD --noflush < "$IPTABLES_RUNNING_BACKUP" 2>/dev/null; then
                         echo -e "${GREEN}✓ iptables DNAT 规则已恢复${NC}"
                         echo 1 > /proc/sys/net/ipv4/ip_forward
                         STARTED_COUNT=$((STARTED_COUNT+1))
@@ -798,7 +806,7 @@ case $MAIN_ACTION in
                         else
                             RESTORE_CMD="iptables-restore"
                         fi
-                        if $RESTORE_CMD < "$LATEST_BACKUP/iptables_current.txt" 2>/dev/null; then
+                        if $RESTORE_CMD --noflush < "$LATEST_BACKUP/iptables_current.txt" 2>/dev/null; then
                             echo -e "${GREEN}✓ iptables DNAT 规则已恢复${NC}"
                             echo 1 > /proc/sys/net/ipv4/ip_forward
                             # 同时保存为运行时备份
