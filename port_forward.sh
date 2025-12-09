@@ -501,6 +501,12 @@ case $MAIN_ACTION in
                     systemctl stop haproxy port-forward gost-forward realm-forward rinetd nginx 2>/dev/null || true
                     systemctl disable haproxy port-forward gost-forward realm-forward rinetd 2>/dev/null || true
                     
+                    # 强制终止可能残留的进程
+                    echo -e "${YELLOW}清理残留进程...${NC}"
+                    pkill -f "socat.*tcp-listen" 2>/dev/null || true
+                    pkill -f "gost.*forward" 2>/dev/null || true
+                    pkill -f "realm.*forward" 2>/dev/null || true
+                    
                     # 删除服务文件（只删除脚本创建的）
                     echo -e "${YELLOW}删除服务文件...${NC}"
                     rm -f /etc/systemd/system/port-forward.service
@@ -511,22 +517,35 @@ case $MAIN_ACTION in
                     echo -e "${YELLOW}删除配置文件...${NC}"
                     rm -rf /etc/realm
                     rm -rf /etc/gost
+                    rm -f /etc/haproxy/haproxy.cfg
+                    rm -f /etc/rinetd.conf
                     rm -f /root/haproxy_credentials.txt
                     rm -f /root/gost_credentials.txt
+                    rm -f /root/.port_forward_iptables_running.txt
                     if [ -d /etc/nginx/stream.d ]; then
                         rm -f /etc/nginx/stream.d/port-forward.conf
                     fi
                     
-                    # 清理 iptables 规则
+                    # 清理 iptables 规则（完整清理）
                     echo -e "${YELLOW}清理 iptables 规则...${NC}"
                     IPTABLES_CMD=$(get_iptables_cmd)
                     $IPTABLES_CMD-save > /tmp/iptables_before_clean.txt 2>/dev/null || true
+                    
+                    # 清理 DNAT 规则
                     $IPTABLES_CMD -t nat -S 2>/dev/null | grep "\-A.*DNAT" | sed 's/-A/-D/' | while read rule; do
                         $IPTABLES_CMD -t nat $rule 2>/dev/null || true
                     done
+                    
+                    # 清理 MASQUERADE 规则
                     $IPTABLES_CMD -t nat -S 2>/dev/null | grep "\-A.*MASQUERADE" | sed 's/-A/-D/' | while read rule; do
                         $IPTABLES_CMD -t nat $rule 2>/dev/null || true
                     done
+                    
+                    # 清理 FORWARD 链规则
+                    $IPTABLES_CMD -L FORWARD --line-numbers -n 2>/dev/null | grep ACCEPT | tac | awk '{print $1}' | while read line; do
+                        $IPTABLES_CMD -D FORWARD $line 2>/dev/null || true
+                    done
+                    
                     echo -e "${GREEN}iptables 规则已清理${NC}"
                     
                     # 清理下载的二进制文件（只删除脚本安装的）
@@ -535,8 +554,32 @@ case $MAIN_ACTION in
                     rm -f /usr/local/bin/realm
                     
                     systemctl daemon-reload
-                    echo -e "${GREEN}所有服务已卸载！${NC}"
-                    echo -e "${YELLOW}注意：系统内核参数优化已保留，如需恢复请使用'恢复原始配置'功能${NC}"
+                    
+                    echo ""
+                    echo -e "${GREEN}${BOLD}===========================================${NC}"
+                    echo -e "${GREEN}${BOLD}所有转发服务已完全卸载！${NC}"
+                    echo -e "${GREEN}${BOLD}===========================================${NC}"
+                    echo ""
+                    echo -e "${CYAN}已清理内容：${NC}"
+                    echo -e "  ✓ 所有转发服务（systemd）"
+                    echo -e "  ✓ 配置文件（HAProxy、gost、realm、rinetd、nginx）"
+                    echo -e "  ✓ 二进制文件（gost、realm）"
+                    echo -e "  ✓ iptables 转发规则"
+                    echo -e "  ✓ 凭据文件"
+                    echo -e "  ✓ 运行时备份文件"
+                    echo ""
+                    echo -e "${YELLOW}${BOLD}注意事项：${NC}"
+                    echo -e "${YELLOW}1. 系统内核参数优化已保留，如需恢复请使用'恢复原始配置'功能${NC}"
+                    echo -e "${YELLOW}2. 配置备份保存在: /root/.port_forward_backups/${NC}"
+                    echo ""
+                    echo -e "${CYAN}如需完全删除系统软件包，请手动执行：${NC}"
+                    if [ -f /etc/debian_version ]; then
+                        echo -e "  ${YELLOW}apt remove haproxy socat rinetd -y${NC}"
+                        echo -e "  ${YELLOW}apt autoremove -y${NC}"
+                    elif [ -f /etc/redhat-release ]; then
+                        echo -e "  ${YELLOW}yum remove haproxy socat rinetd -y${NC}"
+                    fi
+                    echo ""
                     ;;
                 *)
                     echo -e "${RED}无效选择${NC}"
