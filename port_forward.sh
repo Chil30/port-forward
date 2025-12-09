@@ -15,8 +15,8 @@ NC='\033[0m'
 # 生成随机密码函数
 generate_password() {
     local length=${1:-16}
-    # 使用/dev/urandom生成随机密码，包含大小写字母、数字和特殊字符
-    tr -dc 'A-Za-z0-9!@#$%^&*' < /dev/urandom | head -c $length
+    # 使用/dev/urandom生成随机密码，只包含大小写字母和数字（避免特殊字符在配置文件中的问题）
+    tr -dc 'A-Za-z0-9' < /dev/urandom | head -c $length
 }
 
 # 智能选择 iptables 命令（避免 nftables 兼容性问题）
