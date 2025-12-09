@@ -85,14 +85,14 @@
 ### 方法1：一键安装（推荐）⭐
 
 ```bash
-wget -O port_forward.sh https://raw.githubusercontent.com/YOUR_USERNAME/linux-port-forward/main/port_forward.sh && chmod +x port_forward.sh && sudo ./port_forward.sh
+wget -O port_forward.sh https://raw.githubusercontent.com/Chil30/port-forward/main/port_forward.sh && chmod +x port_forward.sh && sudo ./port_forward.sh
 ```
 
 ### 方法2：分步安装
 
 ```bash
 # 1. 下载脚本
-wget https://raw.githubusercontent.com/YOUR_USERNAME/linux-port-forward/main/port_forward.sh
+wget https://raw.githubusercontent.com/Chil30/port-forward/main/port_forward.sh
 
 # 2. 添加执行权限
 chmod +x port_forward.sh
@@ -104,7 +104,7 @@ sudo ./port_forward.sh
 ### 方法3：curl 安装
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/YOUR_USERNAME/linux-port-forward/main/port_forward.sh -o port_forward.sh && chmod +x port_forward.sh && sudo ./port_forward.sh
+curl -fsSL https://raw.githubusercontent.com/Chil30/port-forward/main/port_forward.sh -o port_forward.sh && chmod +x port_forward.sh && sudo ./port_forward.sh
 ```
 
 > **💡 提示**：脚本需要交互式输入，不支持通过管道直接运行。
