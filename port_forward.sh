@@ -10,7 +10,7 @@
 
 # 版本信息
 VERSION="1.0.0"
-AUTHOR="Assistant"
+AUTHOR="Chli30"
 GITHUB_URL="https://github.com/Chil30/port-forward"
 
 # 颜色定义
