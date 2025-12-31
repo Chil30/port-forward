@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================================
-# 端口转发管理工具 v1.0
-# 支持多种转发方案：iptables/HAProxy/socat/gost/realm/rinetd/nginx
+# 端口转发管理工具 v1.0.1
+# 支持多种转发方案：iptables/nftables/HAProxy/socat/gost/realm/rinetd/nginx
 # 
 # 作者: Chli30
 # 项目: https://github.com/Chil30/port-forward
@@ -9,9 +9,13 @@
 # ============================================================================
 
 # 版本信息
-VERSION="1.0.0"
+VERSION="1.0.1"
 AUTHOR="Chli30"
 GITHUB_URL="https://github.com/Chil30/port-forward"
+
+# 流量统计文件
+TRAFFIC_STATS_FILE="/var/lib/port-forward/traffic_stats.json"
+TRAFFIC_STATS_DIR="/var/lib/port-forward"
 
 # 颜色定义
 RED='\033[0;31m'
@@ -23,6 +27,93 @@ MAGENTA='\033[0;35m'
 BOLD='\033[1m'
 DIM='\033[2m'
 NC='\033[0m'
+
+# 初始化流量统计目录
+init_traffic_stats() {
+    mkdir -p "$TRAFFIC_STATS_DIR"
+    if [ ! -f "$TRAFFIC_STATS_FILE" ]; then
+        echo '{"rules":{}}' > "$TRAFFIC_STATS_FILE"
+    fi
+}
+
+# 获取 nftables 流量统计
+get_nft_traffic() {
+    local port=$1
+    if command -v nft >/dev/null 2>&1; then
+        local bytes=$(nft list chain inet port_forward prerouting 2>/dev/null | grep -E "dport $port.*counter" | grep -oE 'bytes [0-9]+' | awk '{print $2}' | head -1)
+        echo "${bytes:-0}"
+    else
+        echo "0"
+    fi
+}
+
+# 获取 iptables 流量统计
+get_iptables_traffic() {
+    local port=$1
+    local IPTABLES_CMD=$(get_iptables_cmd)
+    local bytes=$($IPTABLES_CMD -t nat -L PREROUTING -n -v 2>/dev/null | grep "dpt:$port" | awk '{print $2}' | head -1)
+    # 转换为字节数
+    if [[ "$bytes" =~ ^[0-9]+$ ]]; then
+        echo "$bytes"
+    elif [[ "$bytes" =~ ^([0-9.]+)K$ ]]; then
+        echo $(echo "${BASH_REMATCH[1]} * 1024" | bc 2>/dev/null || echo "0")
+    elif [[ "$bytes" =~ ^([0-9.]+)M$ ]]; then
+        echo $(echo "${BASH_REMATCH[1]} * 1048576" | bc 2>/dev/null || echo "0")
+    elif [[ "$bytes" =~ ^([0-9.]+)G$ ]]; then
+        echo $(echo "${BASH_REMATCH[1]} * 1073741824" | bc 2>/dev/null || echo "0")
+    else
+        echo "0"
+    fi
+}
+
+# 格式化流量显示
+format_traffic() {
+    local bytes=$1
+    if [ -z "$bytes" ] || [ "$bytes" = "0" ]; then
+        echo "0 B"
+        return
+    fi
+    
+    if [ "$bytes" -lt 1024 ]; then
+        echo "${bytes} B"
+    elif [ "$bytes" -lt 1048576 ]; then
+        echo "$(echo "scale=2; $bytes/1024" | bc 2>/dev/null || echo "0") KB"
+    elif [ "$bytes" -lt 1073741824 ]; then
+        echo "$(echo "scale=2; $bytes/1048576" | bc 2>/dev/null || echo "0") MB"
+    else
+        echo "$(echo "scale=2; $bytes/1073741824" | bc 2>/dev/null || echo "0") GB"
+    fi
+}
+
+# 检测系统使用的防火墙类型
+detect_firewall_backend() {
+    # 检查是否有 nftables
+    if command -v nft >/dev/null 2>&1; then
+        # 检查 nftables 是否有规则
+        if nft list tables 2>/dev/null | grep -q .; then
+            echo "nftables"
+            return
+        fi
+    fi
+    
+    # 检查 iptables-nft (iptables 使用 nftables 后端)
+    if iptables -V 2>/dev/null | grep -q "nf_tables"; then
+        echo "iptables-nft"
+        return
+    fi
+    
+    # 默认使用 iptables-legacy
+    echo "iptables-legacy"
+}
+
+# 获取 nft 命令
+get_nft_cmd() {
+    if command -v nft >/dev/null 2>&1; then
+        echo "nft"
+    else
+        echo ""
+    fi
+}
 
 # 生成随机密码函数
 generate_password() {
@@ -39,9 +130,33 @@ get_iptables_cmd() {
     fi
 }
 
+# 检查 nftables 转发规则是否存在
+check_nft_forward_running() {
+    if command -v nft >/dev/null 2>&1; then
+        if nft list chain inet port_forward prerouting 2>/dev/null | grep -q "dnat"; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# 获取 nftables 转发规则数量
+get_nft_forward_count() {
+    if command -v nft >/dev/null 2>&1; then
+        nft list chain inet port_forward prerouting 2>/dev/null | grep -c "dnat" || echo "0"
+    else
+        echo "0"
+    fi
+}
+
 # 检查转发服务是否运行
 check_forward_running() {
     local IPTABLES_CMD=$(get_iptables_cmd)
+    
+    # 检查 nftables DNAT规则
+    if check_nft_forward_running; then
+        return 0
+    fi
     
     # 检查iptables DNAT规则
     if $IPTABLES_CMD -t nat -L PREROUTING -n 2>/dev/null | grep -q DNAT; then
@@ -70,8 +185,14 @@ get_forward_count() {
     local count=0
     local IPTABLES_CMD=$(get_iptables_cmd)
     
+    # nftables DNAT规则数
+    local nft_count=$(get_nft_forward_count | tr -d '[:space:]' | sed 's/^0*//' | grep -E '^[0-9]+$' || echo "")
+    [ -z "$nft_count" ] && nft_count=0
+    count=$((count + nft_count))
+    
     # iptables DNAT规则数
-    local dnat_count=$($IPTABLES_CMD -t nat -L PREROUTING -n 2>/dev/null | grep -c DNAT)
+    local dnat_count=$($IPTABLES_CMD -t nat -L PREROUTING -n 2>/dev/null | grep -c DNAT 2>/dev/null | tr -d '[:space:]' | sed 's/^0*//' | grep -E '^[0-9]+$' || echo "")
+    [ -z "$dnat_count" ] && dnat_count=0
     count=$((count + dnat_count))
     
     # 用户态服务数
@@ -83,7 +204,8 @@ get_forward_count() {
     
     # nginx stream配置数
     if systemctl is-active nginx >/dev/null 2>&1 && [ -d /etc/nginx/stream.d ]; then
-        local nginx_count=$(ls /etc/nginx/stream.d/port-forward-*.conf 2>/dev/null | wc -l)
+        local nginx_count=$(ls /etc/nginx/stream.d/port-forward-*.conf 2>/dev/null | wc -l | tr -d '[:space:]' | sed 's/^0*//' | grep -E '^[0-9]+$' || echo "")
+        [ -z "$nginx_count" ] && nginx_count=0
         count=$((count + nginx_count))
     fi
     
@@ -119,21 +241,67 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-# 脚本安装到系统目录
-SCRIPT_PATH="$(readlink -f "$0")"
-SCRIPT_NAME="$(basename "$SCRIPT_PATH")"
-INSTALL_DIR="/usr/local/bin"
-INSTALL_PATH="$INSTALL_DIR/pf"
+# 初始化流量统计
+init_traffic_stats
 
-# 首次运行时自动安装到系统目录
-if [ "$SCRIPT_PATH" != "$INSTALL_PATH" ] && [ ! -f "$INSTALL_PATH" ]; then
-    echo "首次运行，正在安装到系统目录..."
-    cp "$SCRIPT_PATH" "$INSTALL_PATH" 2>/dev/null && chmod +x "$INSTALL_PATH" 2>/dev/null
-    if [ -f "$INSTALL_PATH" ]; then
-        echo -e "${GREEN}✓ 安装成功！${NC}"
-        echo "快捷命令: pf"
-        sleep 1
+# 快捷命令安装函数 (参考 vless-server.sh)
+create_shortcut() {
+    local system_script="/usr/local/bin/port_forward.sh"
+    local current_script="$0"
+
+    # 获取当前脚本的绝对路径
+    local real_path
+    if [[ "$current_script" == /* ]]; then
+        real_path="$current_script"
+    elif [[ "$current_script" == "bash" || "$current_script" == "-bash" ]]; then
+        # 内存运行模式 (curl | bash)
+        real_path=""
+    else
+        real_path="$(cd "$(dirname "$current_script")" 2>/dev/null && pwd)/$(basename "$current_script")"
     fi
+
+    # 如果系统目录没有脚本，需要创建
+    if [[ ! -f "$system_script" ]]; then
+        if [[ -n "$real_path" && -f "$real_path" ]]; then
+            # 从当前脚本复制（不删除原文件）
+            cp -f "$real_path" "$system_script"
+        else
+            # 内存运行模式，从网络下载
+            local raw_url="https://raw.githubusercontent.com/Chil30/port-forward/main/port_forward.sh"
+            if ! curl -sL --connect-timeout 10 -o "$system_script" "$raw_url"; then
+                echo -e "${YELLOW}无法下载脚本到系统目录${NC}"
+                return 1
+            fi
+        fi
+    elif [[ -n "$real_path" && -f "$real_path" && "$real_path" != "$system_script" ]]; then
+        # 系统目录已有脚本，用当前脚本更新（不删除原文件）
+        cp -f "$real_path" "$system_script"
+    fi
+
+    chmod +x "$system_script" 2>/dev/null
+
+    # 创建软链接
+    ln -sf "$system_script" /usr/local/bin/pf 2>/dev/null
+    ln -sf "$system_script" /usr/bin/pf 2>/dev/null
+    hash -r 2>/dev/null
+
+    echo -e "${GREEN}✓ 快捷命令已创建: pf${NC}"
+}
+
+# 移除快捷命令
+remove_shortcut() { 
+    rm -f /usr/local/bin/pf /usr/local/bin/port_forward.sh /usr/bin/pf 2>/dev/null
+    echo -e "${GREEN}✓ 快捷命令已移除${NC}"
+}
+
+# 首次运行时自动安装快捷命令
+SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+SYSTEM_SCRIPT="/usr/local/bin/port_forward.sh"
+
+if [[ "$SCRIPT_PATH" != "$SYSTEM_SCRIPT" ]] && [[ ! -f "/usr/local/bin/pf" ]]; then
+    echo "首次运行，正在安装快捷命令..."
+    create_shortcut
+    sleep 1
 fi
 
 # 显示头部
@@ -149,17 +317,18 @@ else
     echo "  4) 启动转发服务"
 fi
 echo "  5) 查看备份文件"
-echo "  6) 卸载转发服务"
+echo "  6) 流量统计"
+echo "  7) 卸载转发服务"
 echo "  0) 退出"
 echo ""
 
 while true; do
     read -p "请选择操作 [1]: " MAIN_ACTION
     MAIN_ACTION=${MAIN_ACTION:-1}
-    if [[ $MAIN_ACTION =~ ^[0-6]$ ]]; then
+    if [[ $MAIN_ACTION =~ ^[0-7]$ ]]; then
         break
     else
-        echo "请输入 0-6 之间的数字"
+        echo "请输入 0-7 之间的数字"
     fi
 done
 
@@ -183,16 +352,35 @@ case $MAIN_ACTION in
         echo -e "${CYAN}${BOLD}=== 活跃转发规则 ===${NC}"
         ACTIVE_COUNT=0
         
+        # 0. nftables DNAT 规则
+        if command -v nft >/dev/null 2>&1; then
+            NFT_RULES=$(nft list chain inet port_forward prerouting 2>/dev/null | grep -E "dnat (ip )?to")
+            if [ -n "$NFT_RULES" ]; then
+                echo "$NFT_RULES" | while read line; do
+                    LOCAL_P=$(echo "$line" | grep -oE 'dport [0-9]+' | awk '{print $2}')
+                    TARGET=$(echo "$line" | grep -oE 'dnat (ip )?to [0-9.]+:[0-9]+' | sed -E 's/dnat (ip )?to //')
+                    TRAFFIC=$(get_nft_traffic "$LOCAL_P")
+                    TRAFFIC_FMT=$(format_traffic "$TRAFFIC")
+                    if [ -n "$LOCAL_P" ] && [ -n "$TARGET" ]; then
+                        ACTIVE_COUNT=$((ACTIVE_COUNT+1))
+                        echo -e "${GREEN}✅ nftables${NC}  :$LOCAL_P -> $TARGET  ${CYAN}[${TRAFFIC_FMT}]${NC}"
+                    fi
+                done
+            fi
+        fi
+        
         # 1. iptables DNAT 规则
         IPTABLES_CMD=$(get_iptables_cmd)
-        DNAT_RULES=$($IPTABLES_CMD -t nat -L PREROUTING -n 2>/dev/null | grep DNAT)
+        DNAT_RULES=$($IPTABLES_CMD -t nat -L PREROUTING -n -v 2>/dev/null | grep DNAT)
         if [ -n "$DNAT_RULES" ]; then
             echo "$DNAT_RULES" | while read line; do
                 LOCAL_P=$(echo "$line" | grep -oE 'dpt:[0-9]+' | cut -d: -f2)
                 TARGET=$(echo "$line" | grep -oE 'to:[0-9.]+:[0-9]+' | sed 's/to://')
+                BYTES=$(echo "$line" | awk '{print $2}')
+                TRAFFIC_FMT=$(format_traffic "$BYTES")
                 if [ -n "$LOCAL_P" ] && [ -n "$TARGET" ]; then
                     ACTIVE_COUNT=$((ACTIVE_COUNT+1))
-                    echo -e "${GREEN}✅ iptables${NC}  :$LOCAL_P -> $TARGET"
+                    echo -e "${GREEN}✅ iptables${NC}  :$LOCAL_P -> $TARGET  ${CYAN}[${TRAFFIC_FMT}]${NC}"
                 fi
             done
         fi
@@ -415,7 +603,7 @@ case $MAIN_ACTION in
         echo ""
         echo "=== 当前监听端口 ==="
         if command -v ss >/dev/null 2>&1; then
-            ss -tlnp 2>/dev/null | grep -E 'haproxy|socat|gost|realm|rinetd|nginx' | awk '{print $4, $6}' | column -t | sed 's/^/  /'
+            ss -tlnp 2>/dev/null | grep -E 'haproxy|socat|gost|realm|rinetd|nginx' | awk '{printf "  %-25s %s\n", $4, $6}'
         fi
         
         # IP转发状态
@@ -446,13 +634,14 @@ case $MAIN_ACTION in
         echo "查看运行日志"
         echo ""
         echo "请选择要查看的服务日志："
-        echo "1) iptables 规则和连接"
-        echo "2) HAProxy 日志"
-        echo "3) socat 日志"
-        echo "4) gost 日志"
-        echo "5) realm 日志"
-        echo "6) rinetd 日志"
-        echo "7) nginx stream 日志"
+        echo "1) nftables 规则和连接"
+        echo "2) iptables 规则和连接"
+        echo "3) HAProxy 日志"
+        echo "4) socat 日志"
+        echo "5) gost 日志"
+        echo "6) realm 日志"
+        echo "7) rinetd 日志"
+        echo "8) nginx stream 日志"
         echo "0) 返回主菜单"
         echo ""
         read -p "请选择 [1]: " LOG_CHOICE
@@ -460,6 +649,39 @@ case $MAIN_ACTION in
         
         case $LOG_CHOICE in
             1)
+                echo "nftables 规则和连接状态:"
+                echo ""
+                if command -v nft >/dev/null 2>&1; then
+                    echo "=== nftables 端口转发规则 ==="
+                    if nft list table inet port_forward >/dev/null 2>&1; then
+                        nft list table inet port_forward
+                    else
+                        echo "没有找到 port_forward 表"
+                    fi
+                    echo ""
+                    echo "=== 所有 NAT 规则 ==="
+                    nft list tables | grep -E 'nat|forward' | while read table; do
+                        echo "--- $table ---"
+                        nft list table $table 2>/dev/null
+                    done
+                else
+                    echo "nftables 未安装"
+                fi
+                echo ""
+                echo "=== 当前监听端口 ==="
+                ss -tlnp 2>/dev/null | grep -v "127.0.0" | head -20 || netstat -tlnp 2>/dev/null | grep -v "127.0.0" | head -20
+                echo ""
+                echo "=== 活跃连接 ==="
+                if [ -f /proc/net/nf_conntrack ]; then
+                    cat /proc/net/nf_conntrack | grep -E 'ESTABLISHED|SYN' | head -20
+                    echo ""
+                    echo "总连接数: $(cat /proc/net/nf_conntrack | wc -l)"
+                    echo "ESTABLISHED: $(cat /proc/net/nf_conntrack | grep ESTABLISHED | wc -l)"
+                else
+                    ss -tn 2>/dev/null | grep ESTAB | head -20 || netstat -tn 2>/dev/null | grep ESTABLISHED | head -20
+                fi
+                ;;
+            2)
                 echo "iptables 规则和连接状态:"
                 echo ""
                 echo "=== NAT 转发规则 ==="
@@ -491,7 +713,7 @@ case $MAIN_ACTION in
                     ss -tn 2>/dev/null | grep ESTAB | head -20 || netstat -tn 2>/dev/null | grep ESTABLISHED | head -20
                 fi
                 ;;
-            2)
+            3)
                 if systemctl is-active haproxy >/dev/null 2>&1; then
                     echo "HAProxy 实时日志 (Ctrl+C 退出):"
                     journalctl -u haproxy -f --no-pager -n 50
@@ -499,7 +721,7 @@ case $MAIN_ACTION in
                     echo "HAProxy 服务未运行"
                 fi
                 ;;
-            3)
+            4)
                 if systemctl is-active port-forward >/dev/null 2>&1; then
                     echo "socat 实时日志 (Ctrl+C 退出):"
                     journalctl -u port-forward -f --no-pager -n 50
@@ -507,7 +729,7 @@ case $MAIN_ACTION in
                     echo "socat 服务未运行"
                 fi
                 ;;
-            4)
+            5)
                 if systemctl is-active gost-forward >/dev/null 2>&1; then
                     echo "gost 实时日志 (Ctrl+C 退出):"
                     journalctl -u gost-forward -f --no-pager -n 50
@@ -515,7 +737,7 @@ case $MAIN_ACTION in
                     echo "gost 服务未运行"
                 fi
                 ;;
-            5)
+            6)
                 if systemctl is-active realm-forward >/dev/null 2>&1; then
                     echo "realm 实时日志 (Ctrl+C 退出):"
                     journalctl -u realm-forward -f --no-pager -n 50
@@ -523,7 +745,7 @@ case $MAIN_ACTION in
                     echo "realm 服务未运行"
                 fi
                 ;;
-            6)
+            7)
                 if systemctl is-active rinetd >/dev/null 2>&1; then
                     echo "rinetd 实时日志 (Ctrl+C 退出):"
                     journalctl -u rinetd -f --no-pager -n 50
@@ -531,7 +753,7 @@ case $MAIN_ACTION in
                     echo "rinetd 服务未运行"
                 fi
                 ;;
-            7)
+            8)
                 if systemctl is-active nginx >/dev/null 2>&1; then
                     echo "nginx 实时日志 (Ctrl+C 退出):"
                     if [ -f /var/log/nginx/stream.log ]; then
@@ -562,21 +784,43 @@ case $MAIN_ACTION in
             echo "=== 停止转发服务 ==="
             echo ""
             echo "请选择要停止的服务："
-            echo "1) iptables DNAT 规则"
-            echo "2) HAProxy"
-            echo "3) socat"
-            echo "4) gost"
-            echo "5) realm"
-            echo "6) rinetd"
-            echo "7) nginx"
-            echo "8) 停止所有服务"
+            echo "1) nftables DNAT 规则"
+            echo "2) iptables DNAT 规则"
+            echo "3) HAProxy"
+            echo "4) socat"
+            echo "5) gost"
+            echo "6) realm"
+            echo "7) rinetd"
+            echo "8) nginx"
+            echo "9) 停止所有服务"
             echo "0) 返回主菜单"
             echo ""
-            read -p "请选择 [8]: " STOP_CHOICE
-            STOP_CHOICE=${STOP_CHOICE:-8}
+            read -p "请选择 [9]: " STOP_CHOICE
+            STOP_CHOICE=${STOP_CHOICE:-9}
             
             case $STOP_CHOICE in
                 1)
+                    echo -e "${YELLOW}停止 nftables DNAT 规则...${NC}"
+                    NFT_RUNNING_BACKUP="/root/.port_forward_nftables_running.txt"
+                    
+                    if command -v nft >/dev/null 2>&1; then
+                        # 备份当前规则
+                        if nft list table inet port_forward >/dev/null 2>&1; then
+                            echo -e "${YELLOW}备份当前 nftables 规则...${NC}"
+                            nft list table inet port_forward > "$NFT_RUNNING_BACKUP" 2>/dev/null
+                            echo -e "${GREEN}规则已备份到: $NFT_RUNNING_BACKUP${NC}"
+                            
+                            # 删除表
+                            nft delete table inet port_forward 2>/dev/null
+                            echo -e "${GREEN}✓ nftables DNAT 规则已清理${NC}"
+                        else
+                            echo -e "${YELLOW}没有找到 nftables port_forward 表${NC}"
+                        fi
+                    else
+                        echo -e "${RED}nftables 未安装${NC}"
+                    fi
+                    ;;
+                2)
                     echo -e "${YELLOW}停止 iptables DNAT 规则...${NC}"
                     IPTABLES_CMD=$(get_iptables_cmd)
                     
@@ -606,26 +850,35 @@ case $MAIN_ACTION in
                     done
                     echo -e "${GREEN}✓ iptables DNAT 规则已清理${NC}"
                     ;;
-            2)
+            3)
                 systemctl stop haproxy 2>/dev/null && echo -e "${GREEN}HAProxy已停止${NC}" || echo -e "${YELLOW}HAProxy未运行${NC}"
                 ;;
-            3)
+            4)
                 systemctl stop port-forward 2>/dev/null && echo -e "${GREEN}socat已停止${NC}" || echo -e "${YELLOW}socat未运行${NC}"
                 ;;
-            4)
+            5)
                 systemctl stop gost-forward 2>/dev/null && echo -e "${GREEN}gost已停止${NC}" || echo -e "${YELLOW}gost未运行${NC}"
                 ;;
-            5)
+            6)
                 systemctl stop realm-forward 2>/dev/null && echo -e "${GREEN}realm已停止${NC}" || echo -e "${YELLOW}realm未运行${NC}"
                 ;;
-            6)
+            7)
                 systemctl stop rinetd 2>/dev/null && echo -e "${GREEN}rinetd已停止${NC}" || echo -e "${YELLOW}rinetd未运行${NC}"
                 ;;
-            7)
+            8)
                 systemctl stop nginx 2>/dev/null && echo -e "${GREEN}nginx已停止${NC}" || echo -e "${YELLOW}nginx未运行${NC}"
                 ;;
-            8)
+            9)
                 echo -e "${YELLOW}停止所有转发服务...${NC}"
+                
+                # 备份并清理 nftables 规则
+                NFT_RUNNING_BACKUP="/root/.port_forward_nftables_running.txt"
+                if command -v nft >/dev/null 2>&1 && nft list table inet port_forward >/dev/null 2>&1; then
+                    nft list table inet port_forward > "$NFT_RUNNING_BACKUP" 2>/dev/null
+                    nft delete table inet port_forward 2>/dev/null
+                    echo -e "${GREEN}✓ nftables 规则已备份并清理${NC}"
+                fi
+                
                 # 停止所有systemd服务
                 systemctl stop haproxy 2>/dev/null || true
                 systemctl stop port-forward 2>/dev/null || true
@@ -675,50 +928,65 @@ case $MAIN_ACTION in
             # 检查可用的服务配置
             HAS_OPTIONS=false
             
-            # 1. iptables
+            # 1. nftables
+            NFT_RUNNING_BACKUP="/root/.port_forward_nftables_running.txt"
+            if [ -f "$NFT_RUNNING_BACKUP" ] && [ -s "$NFT_RUNNING_BACKUP" ]; then
+                echo "1) nftables DNAT (从备份恢复)"
+                HAS_OPTIONS=true
+            fi
+            
+            # 也检查 /etc/nftables.d 中的配置
+            if [ -f /etc/nftables.d/port_forward.nft ]; then
+                if [ ! -f "$NFT_RUNNING_BACKUP" ]; then
+                    echo "1) nftables DNAT (从配置恢复)"
+                    HAS_OPTIONS=true
+                fi
+            fi
+            
+            # 2. iptables
             IPTABLES_RUNNING_BACKUP="/root/.port_forward_iptables_running.txt"
             if [ -f "$IPTABLES_RUNNING_BACKUP" ] && [ -s "$IPTABLES_RUNNING_BACKUP" ]; then
-                echo "1) iptables DNAT (从备份恢复)"
+                echo "2) iptables DNAT (从备份恢复)"
                 HAS_OPTIONS=true
             fi
             
-            # 2. HAProxy
+            # 3. HAProxy
             if [ -f /etc/haproxy/haproxy.cfg ] && systemctl is-enabled haproxy >/dev/null 2>&1; then
-                echo "2) HAProxy"
+                echo "3) HAProxy"
                 HAS_OPTIONS=true
             fi
             
-            # 3. socat
+            # 4. socat
             if systemctl is-enabled port-forward >/dev/null 2>&1; then
-                echo "3) socat"
+                echo "4) socat"
                 HAS_OPTIONS=true
             fi
             
-            # 4. gost
+            # 5. gost
             if [ -f /etc/gost/config.json ] && systemctl is-enabled gost-forward >/dev/null 2>&1; then
-                echo "4) gost"
+                echo "5) gost"
                 HAS_OPTIONS=true
             fi
             
-            # 5. realm
+            # 6. realm
             if [ -f /etc/realm/config.toml ] && systemctl is-enabled realm-forward >/dev/null 2>&1; then
-                echo "5) realm"
+                echo "6) realm"
                 HAS_OPTIONS=true
             fi
             
-            # 6. rinetd
+            # 7. rinetd
             if [ -f /etc/rinetd.conf ] && systemctl is-enabled rinetd >/dev/null 2>&1; then
-                echo "6) rinetd"
+                echo "7) rinetd"
                 HAS_OPTIONS=true
             fi
             
-            # 7. nginx stream
+            # 8. nginx stream
             if [ -d /etc/nginx/stream.d ] && ls /etc/nginx/stream.d/port-forward-*.conf >/dev/null 2>&1; then
-                echo "7) nginx stream"
+                echo "8) nginx stream"
                 HAS_OPTIONS=true
             fi
             
-            echo "8) 启动所有可用服务"
+            echo "9) 启动所有可用服务"
             echo "0) 返回主菜单"
             echo ""
             
@@ -726,11 +994,27 @@ case $MAIN_ACTION in
                 echo -e "${YELLOW}未找到任何可启动的转发配置${NC}"
                 echo -e "${YELLOW}请先配置端口转发（选项1）${NC}"
             else
-                read -p "请选择 [8]: " START_CHOICE
-                START_CHOICE=${START_CHOICE:-8}
+                read -p "请选择 [9]: " START_CHOICE
+                START_CHOICE=${START_CHOICE:-9}
                 
                 case $START_CHOICE in
                     1)
+                        # 恢复 nftables 规则
+                        if command -v nft >/dev/null 2>&1; then
+                            echo 1 > /proc/sys/net/ipv4/ip_forward
+                            if [ -f "$NFT_RUNNING_BACKUP" ] && [ -s "$NFT_RUNNING_BACKUP" ]; then
+                                nft -f "$NFT_RUNNING_BACKUP" 2>/dev/null
+                                echo -e "${GREEN}✓ nftables 规则已从备份恢复${NC}"
+                            elif [ -f /etc/nftables.d/port_forward.nft ]; then
+                                nft -f /etc/nftables.d/port_forward.nft 2>/dev/null
+                                echo -e "${GREEN}✓ nftables 规则已从配置恢复${NC}"
+                            fi
+                            nft list table inet port_forward 2>/dev/null | grep -c "dnat" | xargs -I {} echo -e "${GREEN}当前规则数: {}${NC}"
+                        else
+                            echo -e "${RED}nftables 未安装${NC}"
+                        fi
+                        ;;
+                    2)
                         IPTABLES_CMD=$(get_iptables_cmd)
                         if [ -f "$IPTABLES_RUNNING_BACKUP" ]; then
                             echo 1 > /proc/sys/net/ipv4/ip_forward
@@ -743,30 +1027,40 @@ case $MAIN_ACTION in
                             echo -e "${GREEN}✓ iptables 规则已恢复，$DNAT_COUNT 条规则${NC}"
                         fi
                         ;;
-                    2)
+                    3)
                         systemctl start haproxy 2>/dev/null && echo -e "${GREEN}✓ HAProxy 已启动${NC}"
                         ;;
-                    3)
+                    4)
                         systemctl start port-forward 2>/dev/null && echo -e "${GREEN}✓ socat 已启动${NC}"
                         ;;
-                    4)
+                    5)
                         systemctl start gost-forward 2>/dev/null && echo -e "${GREEN}✓ gost 已启动${NC}"
                         ;;
-                    5)
+                    6)
                         systemctl start realm-forward 2>/dev/null && echo -e "${GREEN}✓ realm 已启动${NC}"
                         ;;
-                    6)
+                    7)
                         systemctl start rinetd 2>/dev/null && echo -e "${GREEN}✓ rinetd 已启动${NC}"
                         ;;
-                    7)
+                    8)
                         systemctl start nginx 2>/dev/null && echo -e "${GREEN}✓ nginx 已启动${NC}"
                         ;;
-                    8)
+                    9)
                         echo -e "${YELLOW}启动所有可用服务...${NC}"
+                        echo 1 > /proc/sys/net/ipv4/ip_forward
+                        
+                        # nftables
+                        if command -v nft >/dev/null 2>&1; then
+                            if [ -f "$NFT_RUNNING_BACKUP" ] && [ -s "$NFT_RUNNING_BACKUP" ]; then
+                                nft -f "$NFT_RUNNING_BACKUP" 2>/dev/null && echo -e "${GREEN}✓ nftables 规则已恢复${NC}"
+                            elif [ -f /etc/nftables.d/port_forward.nft ]; then
+                                nft -f /etc/nftables.d/port_forward.nft 2>/dev/null && echo -e "${GREEN}✓ nftables 规则已恢复${NC}"
+                            fi
+                        fi
+                        
                         # iptables
                         if [ -f "$IPTABLES_RUNNING_BACKUP" ] && [ -s "$IPTABLES_RUNNING_BACKUP" ]; then
                             IPTABLES_CMD=$(get_iptables_cmd)
-                            echo 1 > /proc/sys/net/ipv4/ip_forward
                             if [[ "$IPTABLES_CMD" == "iptables-legacy" ]]; then
                                 iptables-legacy-restore < "$IPTABLES_RUNNING_BACKUP" 2>/dev/null
                             else
@@ -774,6 +1068,7 @@ case $MAIN_ACTION in
                             fi
                             echo -e "${GREEN}✓ iptables 规则已恢复${NC}"
                         fi
+                        
                         # 其他服务
                         for service in haproxy port-forward gost-forward realm-forward rinetd nginx; do
                             if systemctl is-enabled "$service" >/dev/null 2>&1; then
@@ -833,10 +1128,94 @@ case $MAIN_ACTION in
         exec $0
         ;;
     6)
+        # 流量统计
+        echo -e "${CYAN}${BOLD}╔═══════════════════════════════════════════╗${NC}"
+        echo -e "${CYAN}${BOLD}║           流量统计                        ║${NC}"
+        echo -e "${CYAN}${BOLD}╚═══════════════════════════════════════════╝${NC}"
+        echo ""
+        
+        TOTAL_TRAFFIC=0
+        HAS_RULES=false
+        
+        # nftables 流量统计
+        if command -v nft >/dev/null 2>&1; then
+            NFT_RULES=$(nft list chain inet port_forward prerouting 2>/dev/null | grep -E "dnat (ip )?to")
+            if [ -n "$NFT_RULES" ]; then
+                echo -e "${CYAN}${BOLD}=== nftables 转发流量 ===${NC}"
+                echo "$NFT_RULES" | while read line; do
+                    LOCAL_P=$(echo "$line" | grep -oE 'dport [0-9]+' | awk '{print $2}')
+                    TARGET=$(echo "$line" | grep -oE 'dnat (ip )?to [0-9.]+:[0-9]+' | sed -E 's/dnat (ip )?to //')
+                    BYTES=$(echo "$line" | grep -oE 'bytes [0-9]+' | awk '{print $2}')
+                    PACKETS=$(echo "$line" | grep -oE 'packets [0-9]+' | awk '{print $2}')
+                    TRAFFIC_FMT=$(format_traffic "${BYTES:-0}")
+                    if [ -n "$LOCAL_P" ] && [ -n "$TARGET" ]; then
+                        HAS_RULES=true
+                        echo -e "  :${LOCAL_P} -> ${TARGET}"
+                        echo -e "    流量: ${GREEN}${TRAFFIC_FMT}${NC}  包数: ${CYAN}${PACKETS:-0}${NC}"
+                    fi
+                done
+                echo ""
+            fi
+        fi
+        
+        # iptables 流量统计
+        IPTABLES_CMD=$(get_iptables_cmd)
+        DNAT_RULES=$($IPTABLES_CMD -t nat -L PREROUTING -n -v 2>/dev/null | grep DNAT)
+        if [ -n "$DNAT_RULES" ]; then
+            echo -e "${CYAN}${BOLD}=== iptables 转发流量 ===${NC}"
+            echo "$DNAT_RULES" | while read line; do
+                LOCAL_P=$(echo "$line" | grep -oE 'dpt:[0-9]+' | cut -d: -f2)
+                TARGET=$(echo "$line" | grep -oE 'to:[0-9.]+:[0-9]+' | sed 's/to://')
+                PACKETS=$(echo "$line" | awk '{print $1}')
+                BYTES=$(echo "$line" | awk '{print $2}')
+                TRAFFIC_FMT=$(format_traffic "${BYTES:-0}")
+                if [ -n "$LOCAL_P" ] && [ -n "$TARGET" ]; then
+                    HAS_RULES=true
+                    echo -e "  :${LOCAL_P} -> ${TARGET}"
+                    echo -e "    流量: ${GREEN}${TRAFFIC_FMT}${NC}  包数: ${CYAN}${PACKETS:-0}${NC}"
+                fi
+            done
+            echo ""
+        fi
+        
+        # 连接跟踪统计
+        echo -e "${CYAN}${BOLD}=== 连接跟踪统计 ===${NC}"
+        if [ -f /proc/net/nf_conntrack ]; then
+            TOTAL_CONN=$(cat /proc/net/nf_conntrack 2>/dev/null | wc -l)
+            ESTABLISHED=$(cat /proc/net/nf_conntrack 2>/dev/null | grep -c ESTABLISHED)
+            SYN_SENT=$(cat /proc/net/nf_conntrack 2>/dev/null | grep -c SYN_SENT)
+            TIME_WAIT=$(cat /proc/net/nf_conntrack 2>/dev/null | grep -c TIME_WAIT)
+            echo -e "  总连接数: ${GREEN}${TOTAL_CONN}${NC}"
+            echo -e "  ESTABLISHED: ${GREEN}${ESTABLISHED}${NC}"
+            echo -e "  SYN_SENT: ${YELLOW}${SYN_SENT}${NC}"
+            echo -e "  TIME_WAIT: ${CYAN}${TIME_WAIT}${NC}"
+        else
+            echo -e "  ${DIM}连接跟踪信息不可用${NC}"
+        fi
+        
+        # 网络接口流量
+        echo ""
+        echo -e "${CYAN}${BOLD}=== 网络接口流量 ===${NC}"
+        for iface in $(ls /sys/class/net/ 2>/dev/null | grep -v lo); do
+            RX_BYTES=$(cat /sys/class/net/$iface/statistics/rx_bytes 2>/dev/null || echo "0")
+            TX_BYTES=$(cat /sys/class/net/$iface/statistics/tx_bytes 2>/dev/null || echo "0")
+            RX_FMT=$(format_traffic "$RX_BYTES")
+            TX_FMT=$(format_traffic "$TX_BYTES")
+            echo -e "  ${BOLD}$iface${NC}: 接收 ${GREEN}${RX_FMT}${NC} / 发送 ${CYAN}${TX_FMT}${NC}"
+        done
+        
+        echo ""
+        echo -e "${YELLOW}提示: 流量统计会在服务重启后重置${NC}"
+        echo ""
+        echo "按回车键返回主菜单..."
+        read
+        exec $0
+        ;;
+    7)
         echo -e "${CYAN}${BOLD}=== 卸载转发服务 ===${NC}"
         echo ""
         echo -e "${YELLOW}请选择要卸载的服务：${NC}"
-        echo -e "1) iptables DNAT 规则"
+        echo -e "1) iptables/nftables DNAT 规则"
         echo -e "2) HAProxy"
         echo -e "3) socat (port-forward)"
         echo -e "4) gost"
@@ -859,7 +1238,9 @@ case $MAIN_ACTION in
         if [[ $CONFIRM_UNINSTALL =~ ^[Yy]$ ]]; then
             case $UNINSTALL_CHOICE in
                 1)
-                    echo -e "${YELLOW}清理 iptables DNAT 规则...${NC}"
+                    echo -e "${YELLOW}清理 iptables/nftables DNAT 规则...${NC}"
+                    
+                    # 清理 iptables 规则
                     IPTABLES_CMD=$(get_iptables_cmd)
                     $IPTABLES_CMD -t nat -S 2>/dev/null | grep "\-A.*DNAT" | sed 's/-A/-D/' | while read rule; do
                         $IPTABLES_CMD -t nat $rule 2>/dev/null || true
@@ -868,6 +1249,13 @@ case $MAIN_ACTION in
                         $IPTABLES_CMD -t nat $rule 2>/dev/null || true
                     done
                     echo -e "${GREEN}✓ iptables DNAT 规则已清理${NC}"
+                    
+                    # 清理 nftables 规则
+                    if command -v nft >/dev/null 2>&1; then
+                        nft delete table inet port_forward 2>/dev/null || true
+                        rm -f /etc/nftables.d/port_forward.nft 2>/dev/null || true
+                        echo -e "${GREEN}✓ nftables DNAT 规则已清理${NC}"
+                    fi
                     ;;
                 2)
                     systemctl stop haproxy 2>/dev/null || true
@@ -1097,24 +1485,25 @@ echo -e "${CYAN}${BOLD}========== 转发方案对比 ==========${NC}"
 echo ""
 echo -e "${YELLOW}方案选择：${NC}"
 echo -e "1) ${GREEN}iptables DNAT${NC}   - 延迟: 低      | 适用: ${BOLD}游戏/RDP/VNC${NC}"
-echo -e "2) ${BLUE}HAProxy${NC}         - 延迟: 较低    | 适用: ${BOLD}Web服务/负载均衡${NC}"
-echo -e "3) ${CYAN}socat${NC}           - 延迟: 较低    | 适用: ${BOLD}通用TCP转发${NC}"
-echo -e "4) ${YELLOW}gost${NC}            - 延迟: 中等    | 适用: ${BOLD}加密代理/多协议${NC}"
-echo -e "5) ${MAGENTA}realm${NC}           - 延迟: 较低    | 适用: ${BOLD}高并发场景${NC}"
-echo -e "6) ${BLUE}rinetd${NC}          - 延迟: 较低    | 适用: ${BOLD}多端口转发${NC}"
-echo -e "7) ${CYAN}nginx stream${NC}    - 延迟: 较低    | 适用: ${BOLD}Web场景/SSL${NC}"
+echo -e "2) ${MAGENTA}nftables DNAT${NC}   - 延迟: 低      | 适用: ${BOLD}新系统/高性能${NC}"
+echo -e "3) ${BLUE}HAProxy${NC}         - 延迟: 较低    | 适用: ${BOLD}Web服务/负载均衡${NC}"
+echo -e "4) ${CYAN}socat${NC}           - 延迟: 较低    | 适用: ${BOLD}通用TCP转发${NC}"
+echo -e "5) ${YELLOW}gost${NC}            - 延迟: 中等    | 适用: ${BOLD}加密代理/多协议${NC}"
+echo -e "6) ${MAGENTA}realm${NC}           - 延迟: 较低    | 适用: ${BOLD}高并发场景${NC}"
+echo -e "7) ${BLUE}rinetd${NC}          - 延迟: 较低    | 适用: ${BOLD}多端口转发${NC}"
+echo -e "8) ${CYAN}nginx stream${NC}    - 延迟: 较低    | 适用: ${BOLD}Web场景/SSL${NC}"
 echo ""
-echo -e "${CYAN}性能: ${GREEN}iptables${NC} > ${MAGENTA}realm${NC} > ${BLUE}HAProxy/nginx${NC} > ${CYAN}socat/rinetd${NC} > ${YELLOW}gost${NC}"
-echo -e "${CYAN}功能: ${YELLOW}gost${NC} > ${BLUE}nginx/HAProxy${NC} > ${MAGENTA}realm${NC} > ${CYAN}socat/rinetd${NC} > ${GREEN}iptables${NC}"
+echo -e "${CYAN}性能: ${GREEN}iptables/nftables${NC} > ${MAGENTA}realm${NC} > ${BLUE}HAProxy/nginx${NC} > ${CYAN}socat/rinetd${NC} > ${YELLOW}gost${NC}"
+echo -e "${CYAN}功能: ${YELLOW}gost${NC} > ${BLUE}nginx/HAProxy${NC} > ${MAGENTA}realm${NC} > ${CYAN}socat/rinetd${NC} > ${GREEN}iptables/nftables${NC}"
 echo ""
 
 while true; do
     read -p "$(echo -e ${YELLOW}请选择方案 [1]: ${NC})" FORWARD_METHOD
     FORWARD_METHOD=${FORWARD_METHOD:-1}
-    if [[ $FORWARD_METHOD =~ ^[1-7]$ ]]; then
+    if [[ $FORWARD_METHOD =~ ^[1-8]$ ]]; then
         break
     else
-        echo -e "${RED}请输入 1-7 之间的数字${NC}"
+        echo -e "${RED}请输入 1-8 之间的数字${NC}"
     fi
 done
 
@@ -1124,12 +1513,13 @@ echo -e "目标服务器: ${BOLD}$TARGET_IP:$TARGET_PORT${NC}"
 echo -e "本地监听: ${BOLD}0.0.0.0:$LOCAL_PORT${NC}"
 case $FORWARD_METHOD in
     1) echo -e "转发方案: ${BOLD}iptables DNAT${NC}" ;;
-    2) echo -e "转发方案: ${BOLD}HAProxy${NC}" ;;
-    3) echo -e "转发方案: ${BOLD}socat${NC}" ;;
-    4) echo -e "转发方案: ${BOLD}gost${NC}" ;;
-    5) echo -e "转发方案: ${BOLD}realm${NC}" ;;
-    6) echo -e "转发方案: ${BOLD}rinetd${NC}" ;;
-    7) echo -e "转发方案: ${BOLD}nginx stream${NC}" ;;
+    2) echo -e "转发方案: ${BOLD}nftables DNAT${NC}" ;;
+    3) echo -e "转发方案: ${BOLD}HAProxy${NC}" ;;
+    4) echo -e "转发方案: ${BOLD}socat${NC}" ;;
+    5) echo -e "转发方案: ${BOLD}gost${NC}" ;;
+    6) echo -e "转发方案: ${BOLD}realm${NC}" ;;
+    7) echo -e "转发方案: ${BOLD}rinetd${NC}" ;;
+    8) echo -e "转发方案: ${BOLD}nginx stream${NC}" ;;
 esac
 echo ""
 
@@ -1154,12 +1544,13 @@ iptables-save > "$BACKUP_DIR/iptables_backup.txt" 2>/dev/null || true
 # 获取转发方案名称
 case $FORWARD_METHOD in
     1) METHOD_NAME="iptables DNAT" ;;
-    2) METHOD_NAME="HAProxy" ;;
-    3) METHOD_NAME="socat" ;;
-    4) METHOD_NAME="gost" ;;
-    5) METHOD_NAME="realm" ;;
-    6) METHOD_NAME="rinetd" ;;
-    7) METHOD_NAME="nginx stream" ;;
+    2) METHOD_NAME="nftables DNAT" ;;
+    3) METHOD_NAME="HAProxy" ;;
+    4) METHOD_NAME="socat" ;;
+    5) METHOD_NAME="gost" ;;
+    6) METHOD_NAME="realm" ;;
+    7) METHOD_NAME="rinetd" ;;
+    8) METHOD_NAME="nginx stream" ;;
     *) METHOD_NAME="未知" ;;
 esac
 
@@ -1243,34 +1634,47 @@ case $FORWARD_METHOD in
         echo -e "${YELLOW}已清理 iptables 端口 $LOCAL_PORT 的旧规则${NC}"
         ;;
     2)
+        # nftables - 清理相同端口的规则
+        if command -v nft >/dev/null 2>&1; then
+            # 删除包含该端口的规则
+            nft list chain inet port_forward prerouting 2>/dev/null | grep "dport $LOCAL_PORT" | while read line; do
+                HANDLE=$(echo "$line" | grep -oE 'handle [0-9]+' | awk '{print $2}')
+                if [ -n "$HANDLE" ]; then
+                    nft delete rule inet port_forward prerouting handle $HANDLE 2>/dev/null || true
+                fi
+            done
+        fi
+        echo -e "${YELLOW}已清理 nftables 端口 $LOCAL_PORT 的旧规则${NC}"
+        ;;
+    3)
         # HAProxy
         systemctl stop haproxy 2>/dev/null || true
         echo -e "${YELLOW}已停止 HAProxy${NC}"
         ;;
-    3)
+    4)
         # socat
         systemctl stop port-forward 2>/dev/null || true
         pkill -f "socat.*$LOCAL_PORT" 2>/dev/null || true
         echo -e "${YELLOW}已停止 socat${NC}"
         ;;
-    4)
+    5)
         # gost
         systemctl stop gost-forward 2>/dev/null || true
         pkill -f "gost.*$LOCAL_PORT" 2>/dev/null || true
         echo -e "${YELLOW}已停止 gost${NC}"
         ;;
-    5)
+    6)
         # realm
         systemctl stop realm-forward 2>/dev/null || true
         pkill -f "realm.*$LOCAL_PORT" 2>/dev/null || true
         echo -e "${YELLOW}已停止 realm${NC}"
         ;;
-    6)
+    7)
         # rinetd
         systemctl stop rinetd 2>/dev/null || true
         echo -e "${YELLOW}已停止 rinetd${NC}"
         ;;
-    7)
+    8)
         # nginx
         # nginx 不完全停止，只移除当前端口的 stream 配置
         rm -f /etc/nginx/stream.d/port-forward-${LOCAL_PORT}.conf 2>/dev/null || true
@@ -1379,6 +1783,95 @@ case $FORWARD_METHOD in
         ;;
         
     2)
+        # nftables DNAT - 现代防火墙方案
+        echo -e "${YELLOW}配置nftables DNAT转发...${NC}"
+        echo ""
+        
+        # 检查 nftables 是否可用
+        if ! command -v nft >/dev/null 2>&1; then
+            echo -e "${YELLOW}安装 nftables...${NC}"
+            if [ -f /etc/debian_version ]; then
+                apt-get update -qq && apt-get install -y nftables >/dev/null 2>&1
+            elif [ -f /etc/redhat-release ]; then
+                yum install -y nftables >/dev/null 2>&1
+            fi
+        fi
+        
+        if ! command -v nft >/dev/null 2>&1; then
+            echo -e "${RED}nftables 安装失败，请手动安装${NC}"
+            exit 1
+        fi
+        
+        echo -e "${GREEN}✓ nftables 已安装${NC}"
+        
+        # 1. 启用IP转发
+        echo -e "${CYAN}[1/4] 启用IP转发${NC}"
+        echo 1 > /proc/sys/net/ipv4/ip_forward
+        if ! grep -q "^net.ipv4.ip_forward = 1" /etc/sysctl.conf; then
+            echo "net.ipv4.ip_forward = 1" >> /etc/sysctl.conf
+        fi
+        sysctl -p >/dev/null 2>&1
+        echo -e "${GREEN}✓ 完成${NC}"
+        
+        # 2. 创建 nftables 表和链（如果不存在）
+        echo -e "${CYAN}[2/4] 创建 nftables 表和链${NC}"
+        
+        # 创建表
+        nft add table inet port_forward 2>/dev/null || true
+        
+        # 创建 prerouting 链 (DNAT)
+        nft add chain inet port_forward prerouting '{ type nat hook prerouting priority dstnat; policy accept; }' 2>/dev/null || true
+        
+        # 创建 postrouting 链 (SNAT/MASQUERADE)
+        nft add chain inet port_forward postrouting '{ type nat hook postrouting priority srcnat; policy accept; }' 2>/dev/null || true
+        
+        # 创建 forward 链
+        nft add chain inet port_forward forward '{ type filter hook forward priority filter; policy accept; }' 2>/dev/null || true
+        
+        echo -e "${GREEN}✓ 完成${NC}"
+        
+        # 3. 添加转发规则（带流量统计）
+        echo -e "${CYAN}[3/4] 添加转发规则${NC}"
+        
+        # DNAT 规则 (带 counter 用于流量统计)
+        # 在 inet 表中必须指定 ip 地址族
+        nft add rule inet port_forward prerouting ip protocol tcp tcp dport $LOCAL_PORT counter dnat ip to $TARGET_IP:$TARGET_PORT
+        
+        # MASQUERADE 规则
+        nft add rule inet port_forward postrouting ip daddr $TARGET_IP tcp dport $TARGET_PORT counter masquerade
+        
+        # FORWARD 规则
+        nft add rule inet port_forward forward ip daddr $TARGET_IP tcp dport $TARGET_PORT ct state new,established,related counter accept 2>/dev/null || true
+        nft add rule inet port_forward forward ip saddr $TARGET_IP tcp sport $TARGET_PORT ct state established,related counter accept 2>/dev/null || true
+        
+        echo -e "${GREEN}✓ 完成${NC}"
+        
+        # 4. 保存规则
+        echo -e "${CYAN}[4/4] 保存规则${NC}"
+        
+        # 保存到配置文件
+        mkdir -p /etc/nftables.d
+        nft list table inet port_forward > /etc/nftables.d/port_forward.nft 2>/dev/null || true
+        
+        # 确保 nftables 服务启用
+        systemctl enable nftables 2>/dev/null || true
+        
+        # 备份规则
+        nft list ruleset > "$BACKUP_DIR/nftables_current.txt" 2>/dev/null || true
+        
+        echo -e "${GREEN}✓ 完成${NC}"
+        
+        echo ""
+        echo -e "${GREEN}${BOLD}===========================================${NC}"
+        echo -e "${GREEN}${BOLD}  nftables DNAT 配置完成！${NC}"
+        echo -e "${GREEN}${BOLD}===========================================${NC}"
+        echo -e "${CYAN}转发: ${BOLD}$LOCAL_PORT -> $TARGET_IP:$TARGET_PORT${NC}"
+        echo -e "${YELLOW}查看规则: nft list table inet port_forward${NC}"
+        echo -e "${YELLOW}流量统计: 选择菜单选项 6${NC}"
+        echo -e "${GREEN}${BOLD}===========================================${NC}"
+        ;;
+        
+    3)
         # HAProxy优化版
         echo -e "${YELLOW}配置HAProxy优化转发...${NC}"
         
@@ -1498,7 +1991,7 @@ EOF
         fi
         ;;
         
-    3)
+    4)
         # socat轻量版
         echo -e "${YELLOW}配置socat轻量转发...${NC}"
         
@@ -1541,7 +2034,7 @@ EOF
         fi
         ;;
         
-    4)
+    5)
         # gost代理转发
         echo -e "${YELLOW}配置gost代理转发...${NC}"
         
@@ -1780,7 +2273,7 @@ EOF
         fi
         ;;
         
-    5)
+    6)
         # realm转发
         echo -e "${YELLOW}配置realm转发...${NC}"
         
@@ -1928,7 +2421,7 @@ EOF
         fi
         ;;
         
-    6)
+    7)
         # rinetd转发
         echo -e "${YELLOW}配置rinetd转发...${NC}"
         
@@ -1989,7 +2482,7 @@ EOF
         fi
         ;;
         
-    7)
+    8)
         # nginx stream转发
         echo -e "${YELLOW}配置nginx stream转发...${NC}"
         
@@ -2159,6 +2652,32 @@ case $FORWARD_METHOD in
         fi
         ;;
     2)
+        # nftables DNAT - 详细验证
+        echo -e "${CYAN}验证 nftables 规则:${NC}"
+        
+        # 检查DNAT规则
+        DNAT_CHECK=$(nft list chain inet port_forward prerouting 2>/dev/null | grep "dport $LOCAL_PORT")
+        if [ -n "$DNAT_CHECK" ]; then
+            echo -e "${GREEN}✓ DNAT规则已生效${NC}"
+            echo -e "  ${YELLOW}$DNAT_CHECK${NC}"
+        else
+            echo -e "${RED}✗ DNAT规则未找到${NC}"
+        fi
+        
+        # 检查MASQUERADE规则
+        MASQ_CHECK=$(nft list chain inet port_forward postrouting 2>/dev/null | grep "masquerade")
+        if [ -n "$MASQ_CHECK" ]; then
+            echo -e "${GREEN}✓ MASQUERADE规则已生效${NC}"
+        fi
+        
+        # 检查IP转发
+        if [ "$(cat /proc/sys/net/ipv4/ip_forward)" = "1" ]; then
+            echo -e "${GREEN}✓ IP转发已启用${NC}"
+        else
+            echo -e "${RED}✗ IP转发未启用${NC}"
+        fi
+        ;;
+    3)
         # HAProxy - 检查服务状态
         if systemctl is-active haproxy >/dev/null 2>&1; then
             echo -e "${GREEN}✅ HAProxy服务运行正常${NC}"
@@ -2166,7 +2685,7 @@ case $FORWARD_METHOD in
             echo -e "${RED}❌ HAProxy服务异常${NC}"
         fi
         ;;
-    3)
+    4)
         # socat - 检查服务状态
         if systemctl is-active port-forward >/dev/null 2>&1; then
             echo -e "${GREEN}✅ socat服务运行正常${NC}"
@@ -2174,7 +2693,7 @@ case $FORWARD_METHOD in
             echo -e "${RED}❌ socat服务异常${NC}"
         fi
         ;;
-    4)
+    5)
         # gost - 检查服务状态
         if systemctl is-active gost-forward >/dev/null 2>&1; then
             echo -e "${GREEN}✅ gost服务运行正常${NC}"
@@ -2182,7 +2701,7 @@ case $FORWARD_METHOD in
             echo -e "${RED}❌ gost服务异常${NC}"
         fi
         ;;
-    5)
+    6)
         # realm - 检查服务状态
         if systemctl is-active realm-forward >/dev/null 2>&1; then
             echo -e "${GREEN}✅ realm服务运行正常${NC}"
@@ -2190,7 +2709,7 @@ case $FORWARD_METHOD in
             echo -e "${RED}❌ realm服务异常${NC}"
         fi
         ;;
-    6)
+    7)
         # rinetd - 检查服务状态
         if systemctl is-active rinetd >/dev/null 2>&1; then
             echo -e "${GREEN}✅ rinetd服务运行正常${NC}"
@@ -2198,7 +2717,7 @@ case $FORWARD_METHOD in
             echo -e "${RED}❌ rinetd服务异常${NC}"
         fi
         ;;
-    7)
+    8)
         # nginx - 检查服务状态
         if systemctl is-active nginx >/dev/null 2>&1; then
             echo -e "${GREEN}✅ nginx服务运行正常${NC}"
@@ -2209,7 +2728,7 @@ case $FORWARD_METHOD in
 esac
 
 # 对于用户态服务，检查端口监听（等待服务启动）
-if [[ $FORWARD_METHOD =~ ^[2-7]$ ]]; then
+if [[ $FORWARD_METHOD =~ ^[3-8]$ ]]; then
     sleep 2  # 等待服务完全启动
     if ss -tlnp 2>/dev/null | grep ":${LOCAL_PORT}" >/dev/null; then
         echo -e "${GREEN}✅ 端口 $LOCAL_PORT 监听正常${NC}"
@@ -2278,12 +2797,13 @@ echo "本地地址: $(hostname -I | awk '{print $1}'):$LOCAL_PORT"
 echo "目标地址: $TARGET_IP:$TARGET_PORT"
 case $FORWARD_METHOD in
     1) echo "转发方式: iptables DNAT" ;;
-    2) echo "转发方式: HAProxy" ;;
-    3) echo "转发方式: socat" ;;
-    4) echo "转发方式: gost" ;;
-    5) echo "转发方式: realm" ;;
-    6) echo "转发方式: rinetd" ;;
-    7) echo "转发方式: nginx stream" ;;
+    2) echo "转发方式: nftables DNAT" ;;
+    3) echo "转发方式: HAProxy" ;;
+    4) echo "转发方式: socat" ;;
+    5) echo "转发方式: gost" ;;
+    6) echo "转发方式: realm" ;;
+    7) echo "转发方式: rinetd" ;;
+    8) echo "转发方式: nginx stream" ;;
 esac
 
 # 显示延迟信息
@@ -2313,7 +2833,18 @@ case $FORWARD_METHOD in
         echo "查看规则:"
         echo "  $IPTABLES_CMD -t nat -L -n -v"
         ;;
-    2) 
+    2)
+        LOCAL_IP=$(hostname -I | awk '{print $1}')
+        echo "从其他机器测试:"
+        echo "  telnet $LOCAL_IP $LOCAL_PORT"
+        echo ""
+        echo "查看规则:"
+        echo "  nft list table inet port_forward"
+        echo ""
+        echo "流量统计:"
+        echo "  运行 pf 选择菜单选项 6"
+        ;;
+    3) 
         echo "服务状态: systemctl status haproxy"
         echo "重启服务: systemctl restart haproxy"
         echo "查看日志: journalctl -u haproxy -f"
@@ -2323,12 +2854,12 @@ case $FORWARD_METHOD in
             echo -e "统计页面: http://$(hostname -I | awk '{print $1}'):8888/haproxy-stats"
         fi
         ;;
-    3) 
+    4) 
         echo -e "服务状态: systemctl status port-forward"
         echo -e "重启服务: systemctl restart port-forward"
         echo -e "查看日志: journalctl -u port-forward -f"
         ;;
-    4)
+    5)
         echo -e "服务状态: systemctl status gost-forward"
         echo -e "重启服务: systemctl restart gost-forward"
         echo -e "查看日志: journalctl -u gost-forward -f"
@@ -2344,21 +2875,21 @@ case $FORWARD_METHOD in
             echo "Web API: http://$(hostname -I | awk '{print $1}'):9999/api/config"
         fi
         ;;
-    5)
+    6)
         echo -e "服务状态: systemctl status realm-forward"
         echo -e "重启服务: systemctl restart realm-forward"
         echo -e "查看日志: journalctl -u realm-forward -f"
         echo -e "查看配置: cat /etc/realm/config.toml"
         echo -e "测试realm: realm -c /etc/realm/config.toml"
         ;;
-    6)
+    7)
         echo -e "服务状态: systemctl status rinetd"
         echo -e "重启服务: systemctl restart rinetd"
         echo -e "查看日志: journalctl -u rinetd -f"
         echo -e "查看配置: cat /etc/rinetd.conf"
         echo -e "查看转发日志: tail -f /var/log/rinetd.log"
         ;;
-    7)
+    8)
         # 检测nginx状态页面端口
         if [ -f /etc/nginx/sites-available/status ]; then
             NGINX_STATUS_PORT=$(grep "listen" /etc/nginx/sites-available/status | grep -oP '\d+' || echo "8080")
