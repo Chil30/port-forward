@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================================
-# 端口转发管理工具 v1.0.1
+# 端口转发管理工具 v1.0.2
 # 支持多种转发方案：iptables/nftables/HAProxy/socat/gost/realm/rinetd/nginx
 # 
 # 作者: Chli30
@@ -9,7 +9,7 @@
 # ============================================================================
 
 # 版本信息
-VERSION="1.0.1"
+VERSION="1.0.2"
 AUTHOR="Chli30"
 GITHUB_URL="https://github.com/Chil30/port-forward"
 
@@ -27,6 +27,185 @@ MAGENTA='\033[0;35m'
 BOLD='\033[1m'
 DIM='\033[2m'
 NC='\033[0m'
+
+# GitHub 代理镜像列表 (国内加速) - 代理优先，直连放最后
+GITHUB_MIRRORS=(
+    "https://ghproxy.com/"               # ghproxy 代理 (优先)
+    "https://mirror.ghproxy.com/"        # ghproxy 镜像
+    "https://gh.ddlc.top/"               # ddlc 代理
+    "https://github.moeyy.xyz/"          # moeyy 代理
+    "https://gh-proxy.com/"              # gh-proxy
+    ""                                    # 直连 (最后尝试)
+)
+
+# 智能下载函数 - 自动尝试多个镜像源 (wget 优先)
+# 用法: smart_download <原始URL> <保存路径> [超时秒数]
+# 返回: 0=成功, 1=失败
+smart_download() {
+    local original_url="$1"
+    local output_path="$2"
+    local timeout=${3:-15}  # 默认15秒超时
+    
+    # 检测是否为 GitHub 相关 URL
+    local is_github=false
+    if [[ "$original_url" =~ github\.com|githubusercontent\.com|github\.io ]]; then
+        is_github=true
+    fi
+    
+    # 如果不是 GitHub URL，直接下载
+    if [ "$is_github" = false ]; then
+        if command -v wget >/dev/null 2>&1; then
+            wget -q --timeout="$timeout" -O "$output_path" "$original_url" 2>/dev/null && return 0
+        fi
+        if command -v curl >/dev/null 2>&1; then
+            curl -sL --connect-timeout "$timeout" --max-time 60 -o "$output_path" "$original_url" 2>/dev/null && return 0
+        fi
+        return 1
+    fi
+    
+    # GitHub URL - 尝试多个镜像源 (代理优先)
+    for mirror in "${GITHUB_MIRRORS[@]}"; do
+        local download_url
+        local try_timeout
+        if [ -z "$mirror" ]; then
+            # 直连 - 使用更短的超时
+            download_url="$original_url"
+            try_timeout=8
+        else
+            # 使用代理镜像
+            download_url="${mirror}${original_url}"
+            try_timeout="$timeout"
+        fi
+        
+        echo -e "${DIM}尝试: ${download_url}${NC}" >&2
+        
+        # 清理之前的失败文件
+        rm -f "$output_path" 2>/dev/null
+        
+        # 优先使用 wget 下载
+        if command -v wget >/dev/null 2>&1; then
+            if wget --timeout="$try_timeout" --tries=1 -q -O "$output_path" "$download_url" 2>/dev/null; then
+                # 验证下载是否成功 (文件非空且大于1KB)
+                if [ -f "$output_path" ] && [ -s "$output_path" ]; then
+                    local fsize=$(stat -c%s "$output_path" 2>/dev/null || stat -f%z "$output_path" 2>/dev/null || echo 0)
+                    if [ "$fsize" -gt 1024 ]; then
+                        [ -n "$mirror" ] && echo -e "${GREEN}✓ 使用镜像下载成功${NC}" >&2
+                        return 0
+                    fi
+                fi
+            fi
+        fi
+        
+        # wget 失败，尝试 curl (带 timeout 命令强制限时)
+        rm -f "$output_path" 2>/dev/null
+        if command -v curl >/dev/null 2>&1; then
+            if timeout $((try_timeout + 10)) curl -sL --connect-timeout "$try_timeout" -o "$output_path" "$download_url" 2>/dev/null; then
+                if [ -f "$output_path" ] && [ -s "$output_path" ]; then
+                    local fsize=$(stat -c%s "$output_path" 2>/dev/null || stat -f%z "$output_path" 2>/dev/null || echo 0)
+                    if [ "$fsize" -gt 1024 ]; then
+                        [ -n "$mirror" ] && echo -e "${GREEN}✓ 使用镜像下载成功${NC}" >&2
+                        return 0
+                    fi
+                fi
+            fi
+        fi
+        
+        echo -e "${YELLOW}失败，尝试下一个...${NC}" >&2
+    done
+    
+    rm -f "$output_path" 2>/dev/null
+    echo -e "${RED}所有下载源均失败${NC}" >&2
+    return 1
+}
+
+# 智能执行远程脚本 - 自动尝试多个镜像源 (wget 优先)
+# 用法: smart_bash_remote <原始URL> [参数...]
+# 返回: 脚本执行的返回值
+smart_bash_remote() {
+    local original_url="$1"
+    shift
+    local args="$@"
+    
+    # 检测是否为 GitHub 相关 URL
+    local is_github=false
+    if [[ "$original_url" =~ github\.com|githubusercontent\.com|github\.io ]]; then
+        is_github=true
+    fi
+    
+    # 如果不是 GitHub URL，直接执行 (wget 优先)
+    if [ "$is_github" = false ]; then
+        if command -v wget >/dev/null 2>&1; then
+            bash <(wget -qO- "$original_url") $args && return 0
+        elif command -v curl >/dev/null 2>&1; then
+            bash <(curl -fsSL "$original_url") $args && return 0
+        fi
+        return 1
+    fi
+    
+    # GitHub URL - 尝试多个镜像源 (代理优先, wget 优先)
+    for mirror in "${GITHUB_MIRRORS[@]}"; do
+        local download_url
+        local try_timeout
+        if [ -z "$mirror" ]; then
+            download_url="$original_url"
+            try_timeout=8  # 直连用更短超时
+        else
+            download_url="${mirror}${original_url}"
+            try_timeout=15
+        fi
+        
+        echo -e "${DIM}尝试: ${download_url}${NC}" >&2
+        
+        # wget 优先
+        if command -v wget >/dev/null 2>&1; then
+            if bash <(wget --timeout="$try_timeout" --tries=1 -qO- "$download_url") $args 2>/dev/null; then
+                [ -n "$mirror" ] && echo -e "${GREEN}✓ 使用镜像执行成功${NC}" >&2
+                return 0
+            fi
+        fi
+        
+        # curl 备用
+        if command -v curl >/dev/null 2>&1; then
+            if bash <(timeout $((try_timeout + 5)) curl -fsSL --connect-timeout "$try_timeout" "$download_url") $args 2>/dev/null; then
+                [ -n "$mirror" ] && echo -e "${GREEN}✓ 使用镜像执行成功${NC}" >&2
+                return 0
+            fi
+        fi
+        
+        echo -e "${YELLOW}失败，尝试下一个...${NC}" >&2
+    done
+    
+    return 1
+}
+
+# 智能获取 API 内容 (wget 优先)
+# 用法: smart_api_get <原始URL> [超时秒数]
+# 返回: API 响应内容 (stdout)
+smart_api_get() {
+    local original_url="$1"
+    local timeout=${2:-10}  # API 请求超时
+    local result=""
+    
+    # wget 优先
+    if command -v wget >/dev/null 2>&1; then
+        result=$(wget --timeout="$timeout" --tries=2 -qO- "$original_url" 2>/dev/null)
+        if [ -n "$result" ] && [[ "$result" != *"rate limit"* ]] && [[ "$result" == *"tag_name"* || "$result" == *"{"* ]]; then
+            echo "$result"
+            return
+        fi
+    fi
+    
+    # curl 备用
+    if command -v curl >/dev/null 2>&1; then
+        result=$(curl -s --connect-timeout "$timeout" --max-time $((timeout + 5)) "$original_url" 2>/dev/null)
+        if [ -n "$result" ] && [[ "$result" != *"rate limit"* ]]; then
+            echo "$result"
+            return
+        fi
+    fi
+    
+    echo "$result"
+}
 
 # 初始化流量统计目录
 init_traffic_stats() {
@@ -83,6 +262,142 @@ format_traffic() {
     else
         echo "$(echo "scale=2; $bytes/1073741824" | bc 2>/dev/null || echo "0") GB"
     fi
+}
+
+# 检测本机网络环境
+detect_local_network() {
+    LOCAL_HAS_IPV4=false
+    LOCAL_HAS_IPV6=false
+    LOCAL_IPV4=""
+    LOCAL_IPV6=""
+    LOCAL_IPV4_TYPE=""  # public/private
+    LOCAL_IPV6_TYPE=""  # public/private
+    
+    # 检测 IPv4
+    LOCAL_IPV4=$(ip -4 addr show scope global 2>/dev/null | grep inet | awk '{print $2}' | cut -d/ -f1 | head -1)
+    if [ -n "$LOCAL_IPV4" ]; then
+        LOCAL_HAS_IPV4=true
+        # 判断是否为内网地址
+        # 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10 (CGNAT)
+        if [[ "$LOCAL_IPV4" =~ ^10\. ]] || \
+           [[ "$LOCAL_IPV4" =~ ^172\.(1[6-9]|2[0-9]|3[0-1])\. ]] || \
+           [[ "$LOCAL_IPV4" =~ ^192\.168\. ]] || \
+           [[ "$LOCAL_IPV4" =~ ^100\.(6[4-9]|[7-9][0-9]|1[0-1][0-9]|12[0-7])\. ]]; then
+            LOCAL_IPV4_TYPE="private"
+        else
+            LOCAL_IPV4_TYPE="public"
+        fi
+    fi
+    
+    # 检测 IPv6
+    LOCAL_IPV6=$(ip -6 addr show scope global 2>/dev/null | grep inet6 | awk '{print $2}' | cut -d/ -f1 | head -1)
+    if [ -n "$LOCAL_IPV6" ]; then
+        LOCAL_HAS_IPV6=true
+        # 判断是否为内网地址 (fc00::/7 ULA, fe80::/10 link-local)
+        if [[ "$LOCAL_IPV6" =~ ^[fF][cCdD] ]] || [[ "$LOCAL_IPV6" =~ ^[fF][eE][89aAbB] ]]; then
+            LOCAL_IPV6_TYPE="private"
+        else
+            LOCAL_IPV6_TYPE="public"
+        fi
+    fi
+}
+
+# 智能获取本机 IP 地址 (优先公网，无 IPv4 出口时返回 IPv6)
+get_local_ip() {
+    detect_local_network
+    
+    # 检测是否有 IPv4 出口
+    local has_ipv4_outbound=false
+    if ping -4 -c 1 -W 1 8.8.8.8 &>/dev/null 2>&1 || ping -4 -c 1 -W 1 114.114.114.114 &>/dev/null 2>&1; then
+        has_ipv4_outbound=true
+    fi
+    
+    # 有 IPv4 出口，返回 IPv4 地址
+    if [ "$has_ipv4_outbound" = true ] && [ "$LOCAL_HAS_IPV4" = true ]; then
+        echo "$LOCAL_IPV4"
+        return
+    fi
+    
+    # 无 IPv4 出口，返回 IPv6 地址
+    if [ "$LOCAL_HAS_IPV6" = true ]; then
+        echo "$LOCAL_IPV6"
+        return
+    fi
+    
+    # 兜底：返回 hostname -I 的第一个地址
+    hostname -I 2>/dev/null | awk '{print $1}'
+}
+
+# 配置 DNS64 (仅用于无 IPv4 出口的纯 IPv6 环境)
+setup_dns64() {
+    # 检测 IPv4 出口连通性 (不是检测有没有 IPv4 地址)
+    # 尝试 ping 几个常用的 IPv4 地址
+    local has_ipv4_outbound=false
+    
+    for ip in 8.8.8.8 1.1.1.1 114.114.114.114; do
+        if ping -4 -c 1 -W 2 "$ip" &>/dev/null 2>&1; then
+            has_ipv4_outbound=true
+            break
+        fi
+    done
+    
+    # 有 IPv4 出口，无需 DNS64
+    if [ "$has_ipv4_outbound" = true ]; then
+        return 0
+    fi
+    
+    # 检测是否有 IPv6 地址
+    if ! ip -6 addr show scope global 2>/dev/null | grep -q "inet6 "; then
+        return 0  # 没有 IPv6，也不需要 DNS64
+    fi
+    
+    # 到这里说明是纯 IPv6 环境（无 IPv4 出口），询问用户
+    echo -e "${YELLOW}检测到无 IPv4 出口（纯 IPv6 环境）${NC}"
+    read -p "是否配置 DNS64 以访问 IPv4 资源? [y/N]: " SETUP_DNS64
+    if [[ ! "$SETUP_DNS64" =~ ^[Yy]$ ]]; then
+        return 0
+    fi
+    
+    # 备份原有配置
+    if [[ -f /etc/resolv.conf ]] && [[ ! -f /etc/resolv.conf.bak ]]; then
+        cp /etc/resolv.conf /etc/resolv.conf.bak
+        echo -e "${GREEN}已备份原 DNS 配置到 /etc/resolv.conf.bak${NC}"
+    fi
+    
+    # 写入 DNS64 服务器
+    cat > /etc/resolv.conf << 'EOF'
+nameserver 2a00:1098:2b::1
+nameserver 2001:4860:4860::6464
+nameserver 2a00:1098:2c::1
+EOF
+    
+    echo -e "${GREEN}DNS64 配置完成${NC}"
+}
+
+# 显示本机网络状态
+show_network_status() {
+    detect_local_network
+    
+    echo -e "${CYAN}本机网络:${NC}"
+    if [ "$LOCAL_HAS_IPV4" = true ]; then
+        if [ "$LOCAL_IPV4_TYPE" = "public" ]; then
+            echo -e "  IPv4: ${GREEN}$LOCAL_IPV4 (公网)${NC}"
+        else
+            echo -e "  IPv4: ${YELLOW}$LOCAL_IPV4 (内网)${NC}"
+        fi
+    else
+        echo -e "  IPv4: ${RED}无${NC}"
+    fi
+    if [ "$LOCAL_HAS_IPV6" = true ]; then
+        if [ "$LOCAL_IPV6_TYPE" = "public" ]; then
+            echo -e "  IPv6: ${GREEN}$LOCAL_IPV6 (公网)${NC}"
+        else
+            echo -e "  IPv6: ${YELLOW}$LOCAL_IPV6 (内网)${NC}"
+        fi
+    else
+        echo -e "  IPv6: ${DIM}无${NC}"
+    fi
+    echo ""
 }
 
 # 检测系统使用的防火墙类型
@@ -224,13 +539,35 @@ show_header() {
         status_text="${RED}已停止${NC}"
     fi
     
-    echo "============================================================================"
-    echo "                      端口转发管理工具 v${VERSION}"
-    echo "============================================================================"
-    echo -e "  状态: ${status_text}    转发规则: ${forward_count} 条"
-    echo "  作者: ${AUTHOR}    命令: pf"
-    echo "  项目: ${GITHUB_URL}"
-    echo "============================================================================"
+    # 检测本机网络
+    detect_local_network
+    local net_info=""
+    local has_public_v4=false
+    local has_public_v6=false
+    
+    [ "$LOCAL_IPV4_TYPE" = "public" ] && has_public_v4=true
+    [ "$LOCAL_IPV6_TYPE" = "public" ] && has_public_v6=true
+    
+    if [ "$has_public_v4" = true ] && [ "$has_public_v6" = true ]; then
+        net_info="${GREEN}IPv4+IPv6${NC}"
+    elif [ "$has_public_v4" = true ]; then
+        net_info="${GREEN}IPv4${NC}"
+    elif [ "$has_public_v6" = true ]; then
+        net_info="${CYAN}仅IPv6${NC}"
+    elif [ "$LOCAL_HAS_IPV4" = true ]; then
+        net_info="${YELLOW}内网IPv4${NC}"
+    else
+        net_info="${RED}无公网IP${NC}"
+    fi
+    
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "                    ${CYAN}端口转发管理工具${NC}  ${BOLD}v${VERSION}${NC}"
+    echo -e "${CYAN}───────────────────────────────────────────────────────────────────────────${NC}"
+    echo -e "  状态: ${status_text}    转发规则: ${CYAN}${forward_count}${NC} 条    网络: ${net_info}"
+    echo -e "  作者: ${CYAN}${AUTHOR}${NC}    命令: ${CYAN}pf${NC}"
+    echo -e "  项目: ${CYAN}${GITHUB_URL}${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════════════════${NC}"
     echo ""
 }
 
@@ -266,9 +603,10 @@ create_shortcut() {
             # 从当前脚本复制（不删除原文件）
             cp -f "$real_path" "$system_script"
         else
-            # 内存运行模式，从网络下载
+            # 内存运行模式，从网络下载 (使用智能下载函数)
             local raw_url="https://raw.githubusercontent.com/Chil30/port-forward/main/port_forward.sh"
-            if ! curl -sL --connect-timeout 10 -o "$system_script" "$raw_url"; then
+            echo -e "${CYAN}正在下载脚本...${NC}"
+            if ! smart_download "$raw_url" "$system_script" 15; then
                 echo -e "${YELLOW}无法下载脚本到系统目录${NC}"
                 return 1
             fi
@@ -387,17 +725,22 @@ case $MAIN_ACTION in
         
         # 2. realm
         if systemctl is-active realm-forward >/dev/null 2>&1 && [ -f /etc/realm/config.toml ]; then
-            LOCAL_P=$(grep "listen" /etc/realm/config.toml | grep -oE '"[^"]+:[0-9]+"' | grep -oE '[0-9]+$' | tr -d '"')
-            TARGET=$(grep "remote" /etc/realm/config.toml | grep -oE '"[0-9.]+:[0-9]+"' | tr -d '"')
-            if [ -n "$TARGET" ]; then
-                ACTIVE_COUNT=$((ACTIVE_COUNT+1))
-                echo -e "${GREEN}✅ realm${NC}     :$LOCAL_P -> $TARGET"
-            fi
+            # 解析所有 endpoint
+            while IFS= read -r listen_line; do
+                LOCAL_P=$(echo "$listen_line" | grep -oE '[0-9]+$')
+                read -r remote_line
+                TARGET=$(echo "$remote_line" | sed -n 's/.*remote = "\([^"]*\)".*/\1/p')
+                if [ -n "$LOCAL_P" ] && [ -n "$TARGET" ]; then
+                    ACTIVE_COUNT=$((ACTIVE_COUNT+1))
+                    echo -e "${GREEN}✅ realm${NC}     :$LOCAL_P -> $TARGET"
+                fi
+            done < <(grep -E "^listen|^remote" /etc/realm/config.toml 2>/dev/null)
         fi
         
         # 3. gost
         if systemctl is-active gost-forward >/dev/null 2>&1 && [ -f /etc/gost/config.json ]; then
-            TARGET=$(grep -oE '"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+"' /etc/gost/config.json | tr -d '"' | head -1)
+            # 支持 IPv4 和 IPv6 (带方括号) 地址提取
+            TARGET=$(grep -oE '"\[?[0-9a-fA-F:.]+\]?:[0-9]+"' /etc/gost/config.json | grep -v '^":' | tr -d '"' | head -1)
             LOCAL_P=$(grep -oE '":[0-9]+"' /etc/gost/config.json | tr -d '":' | head -1)
             if [ -n "$TARGET" ]; then
                 ACTIVE_COUNT=$((ACTIVE_COUNT+1))
@@ -408,7 +751,8 @@ case $MAIN_ACTION in
         # 4. haproxy
         if systemctl is-active haproxy >/dev/null 2>&1 && [ -f /etc/haproxy/haproxy.cfg ]; then
             LOCAL_P=$(grep "bind \*:" /etc/haproxy/haproxy.cfg | grep -oE ':[0-9]+' | tr -d ':' | head -1)
-            TARGET=$(grep "server " /etc/haproxy/haproxy.cfg | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+' | head -1)
+            # 支持 IPv4 和 IPv6 (带方括号) 地址提取
+            TARGET=$(grep "server " /etc/haproxy/haproxy.cfg | sed -n 's/.*server [^ ]* \([^ ]*\).*/\1/p' | head -1)
             if [ -n "$TARGET" ]; then
                 ACTIVE_COUNT=$((ACTIVE_COUNT+1))
                 echo -e "${GREEN}✅ haproxy${NC}   :$LOCAL_P -> $TARGET"
@@ -439,7 +783,8 @@ case $MAIN_ACTION in
             for conf in /etc/nginx/stream.d/port-forward-*.conf; do
                 [ -f "$conf" ] || continue
                 LOCAL_P=$(grep "listen" "$conf" | grep -oE '[0-9]+' | head -1)
-                TARGET=$(grep "server " "$conf" | grep -oE '[0-9.]+:[0-9]+' | head -1)
+                # 支持 IPv4 和 IPv6 (带方括号) 地址提取
+                TARGET=$(grep "proxy_pass" "$conf" | sed -n 's/.*proxy_pass \([^;]*\);.*/\1/p' | head -1)
                 if [ -n "$TARGET" ]; then
                     ACTIVE_COUNT=$((ACTIVE_COUNT+1))
                     echo -e "${GREEN}✅ nginx${NC}     :$LOCAL_P -> $TARGET"
@@ -472,7 +817,20 @@ case $MAIN_ACTION in
             TESTED_IPS="$TESTED_IPS $ip"
             
             echo -n "  $label $ip:$port ... "
-            PING_RESULT=$(ping -c 1 -W 2 $ip 2>/dev/null | grep 'time=' | sed 's/.*time=\([0-9.]*\).*/\1/')
+            
+            # 判断是 IPv4 还是 IPv6
+            local is_ipv6=false
+            [[ "$ip" =~ : ]] && is_ipv6=true
+            
+            # 优先用 ping 测试延迟
+            local PING_RESULT=""
+            if [ "$is_ipv6" = true ]; then
+                PING_RESULT=$(ping -6 -c 1 -W 2 "$ip" 2>/dev/null | grep 'time=' | sed 's/.*time=\([0-9.]*\).*/\1/')
+            else
+                # 纯 IPv6 环境无法 ping IPv4，先尝试
+                PING_RESULT=$(ping -c 1 -W 2 "$ip" 2>/dev/null | grep 'time=' | sed 's/.*time=\([0-9.]*\).*/\1/')
+            fi
+            
             if [ -n "$PING_RESULT" ]; then
                 PING_INT=${PING_RESULT%.*}
                 if [ "$PING_INT" -lt 50 ]; then
@@ -483,7 +841,25 @@ case $MAIN_ACTION in
                     echo -e "${RED}${PING_RESULT}ms${NC} (较高)"
                 fi
             else
-                echo -e "${RED}超时${NC}"
+                # ping 失败，尝试 TCP 连接测试（支持 NAT64 环境）
+                local start_time=$(date +%s%3N 2>/dev/null || echo "0")
+                if timeout 3 bash -c "echo >/dev/tcp/$ip/$port" 2>/dev/null; then
+                    local end_time=$(date +%s%3N 2>/dev/null || echo "0")
+                    if [ "$start_time" != "0" ] && [ "$end_time" != "0" ]; then
+                        local tcp_ms=$((end_time - start_time))
+                        if [ "$tcp_ms" -lt 50 ]; then
+                            echo -e "${GREEN}${tcp_ms}ms${NC} (TCP) ✓"
+                        elif [ "$tcp_ms" -lt 150 ]; then
+                            echo -e "${YELLOW}${tcp_ms}ms${NC} (TCP)"
+                        else
+                            echo -e "${RED}${tcp_ms}ms${NC} (TCP)"
+                        fi
+                    else
+                        echo -e "${GREEN}可达${NC} (TCP)"
+                    fi
+                else
+                    echo -e "${RED}超时${NC}"
+                fi
             fi
         }
         
@@ -501,33 +877,51 @@ case $MAIN_ACTION in
         
         # 从 realm 配置获取
         if systemctl is-active realm-forward >/dev/null 2>&1 && [ -f /etc/realm/config.toml ]; then
-            TARGET_ADDR=$(grep "remote" /etc/realm/config.toml | grep -oE '"[0-9.]+:[0-9]+"' | tr -d '"' | head -1)
+            TARGET_ADDR=$(grep "remote" /etc/realm/config.toml | sed -n 's/.*remote = "\([^"]*\)".*/\1/p' | head -1)
             if [ -n "$TARGET_ADDR" ]; then
                 HAS_TARGET=true
-                TARGET_IP=$(echo "$TARGET_ADDR" | cut -d: -f1)
-                TARGET_PORT=$(echo "$TARGET_ADDR" | cut -d: -f2)
+                # 处理 IPv6 地址 [IPv6]:port 格式
+                if [[ "$TARGET_ADDR" =~ ^\[.*\]:[0-9]+$ ]]; then
+                    TARGET_IP=$(echo "$TARGET_ADDR" | sed 's/\[\(.*\)\]:.*/\1/')
+                    TARGET_PORT=$(echo "$TARGET_ADDR" | sed 's/.*\]://')
+                else
+                    TARGET_IP=$(echo "$TARGET_ADDR" | cut -d: -f1)
+                    TARGET_PORT=$(echo "$TARGET_ADDR" | cut -d: -f2)
+                fi
                 do_ping_test "$TARGET_IP" "$TARGET_PORT" "realm"
             fi
         fi
         
         # 从 gost 配置获取
         if systemctl is-active gost-forward >/dev/null 2>&1 && [ -f /etc/gost/config.json ]; then
-            TARGET_ADDR=$(grep -oE '"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+"' /etc/gost/config.json | tr -d '"' | head -1)
+            TARGET_ADDR=$(grep -oE '"\[?[0-9a-fA-F:.]+\]?:[0-9]+"' /etc/gost/config.json | grep -v '^":' | tr -d '"' | head -1)
             if [ -n "$TARGET_ADDR" ]; then
                 HAS_TARGET=true
-                TARGET_IP=$(echo "$TARGET_ADDR" | cut -d: -f1)
-                TARGET_PORT=$(echo "$TARGET_ADDR" | cut -d: -f2)
+                # 处理 IPv6 地址 [IPv6]:port 格式
+                if [[ "$TARGET_ADDR" =~ ^\[.*\]:[0-9]+$ ]]; then
+                    TARGET_IP=$(echo "$TARGET_ADDR" | sed 's/\[\(.*\)\]:.*/\1/')
+                    TARGET_PORT=$(echo "$TARGET_ADDR" | sed 's/.*\]://')
+                else
+                    TARGET_IP=$(echo "$TARGET_ADDR" | cut -d: -f1)
+                    TARGET_PORT=$(echo "$TARGET_ADDR" | cut -d: -f2)
+                fi
                 do_ping_test "$TARGET_IP" "$TARGET_PORT" "gost"
             fi
         fi
         
         # 从 haproxy 配置获取
         if systemctl is-active haproxy >/dev/null 2>&1 && [ -f /etc/haproxy/haproxy.cfg ]; then
-            TARGET_ADDR=$(grep "server " /etc/haproxy/haproxy.cfg | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+' | head -1)
+            TARGET_ADDR=$(grep "server " /etc/haproxy/haproxy.cfg | sed -n 's/.*server [^ ]* \([^ ]*\).*/\1/p' | head -1)
             if [ -n "$TARGET_ADDR" ]; then
                 HAS_TARGET=true
-                TARGET_IP=$(echo "$TARGET_ADDR" | cut -d: -f1)
-                TARGET_PORT=$(echo "$TARGET_ADDR" | cut -d: -f2)
+                # 处理 IPv6 地址 [IPv6]:port 格式
+                if [[ "$TARGET_ADDR" =~ ^\[.*\]:[0-9]+$ ]]; then
+                    TARGET_IP=$(echo "$TARGET_ADDR" | sed 's/\[\(.*\)\]:.*/\1/')
+                    TARGET_PORT=$(echo "$TARGET_ADDR" | sed 's/.*\]://')
+                else
+                    TARGET_IP=$(echo "$TARGET_ADDR" | cut -d: -f1)
+                    TARGET_PORT=$(echo "$TARGET_ADDR" | cut -d: -f2)
+                fi
                 do_ping_test "$TARGET_IP" "$TARGET_PORT" "haproxy"
             fi
         fi
@@ -547,11 +941,17 @@ case $MAIN_ACTION in
         if systemctl is-active nginx >/dev/null 2>&1 && [ -d /etc/nginx/stream.d ]; then
             for conf in /etc/nginx/stream.d/port-forward-*.conf; do
                 [ -f "$conf" ] || continue
-                TARGET_ADDR=$(grep "server " "$conf" | grep -oE '[0-9.]+:[0-9]+' | head -1)
+                TARGET_ADDR=$(grep "server " "$conf" | sed -n 's/.*server \([^ ;]*\).*/\1/p' | head -1)
                 if [ -n "$TARGET_ADDR" ]; then
                     HAS_TARGET=true
-                    TARGET_IP=$(echo "$TARGET_ADDR" | cut -d: -f1)
-                    TARGET_PORT=$(echo "$TARGET_ADDR" | cut -d: -f2)
+                    # 处理 IPv6 地址 [IPv6]:port 格式
+                    if [[ "$TARGET_ADDR" =~ ^\[.*\]:[0-9]+$ ]]; then
+                        TARGET_IP=$(echo "$TARGET_ADDR" | sed 's/\[\(.*\)\]:.*/\1/')
+                        TARGET_PORT=$(echo "$TARGET_ADDR" | sed 's/.*\]://')
+                    else
+                        TARGET_IP=$(echo "$TARGET_ADDR" | cut -d: -f1)
+                        TARGET_PORT=$(echo "$TARGET_ADDR" | cut -d: -f2)
+                    fi
                     do_ping_test "$TARGET_IP" "$TARGET_PORT" "nginx"
                 fi
             done
@@ -1133,18 +1533,28 @@ case $MAIN_ACTION in
         echo -e "${CYAN}${BOLD}║           流量统计                        ║${NC}"
         echo -e "${CYAN}${BOLD}╚═══════════════════════════════════════════╝${NC}"
         echo ""
+        echo -e "${YELLOW}说明: 仅 iptables/nftables 方案支持内置流量统计${NC}"
+        echo -e "${DIM}其他方案 (realm/gost/haproxy等) 需通过各自管理界面查看${NC}"
+        echo ""
         
         TOTAL_TRAFFIC=0
         HAS_RULES=false
         
-        # nftables 流量统计
+        # nftables 流量统计 (支持 IPv4 和 IPv6)
         if command -v nft >/dev/null 2>&1; then
-            NFT_RULES=$(nft list chain inet port_forward prerouting 2>/dev/null | grep -E "dnat (ip )?to")
+            NFT_RULES=$(nft list chain inet port_forward prerouting 2>/dev/null | grep -E "dnat ip6? to")
             if [ -n "$NFT_RULES" ]; then
                 echo -e "${CYAN}${BOLD}=== nftables 转发流量 ===${NC}"
                 echo "$NFT_RULES" | while read line; do
                     LOCAL_P=$(echo "$line" | grep -oE 'dport [0-9]+' | awk '{print $2}')
-                    TARGET=$(echo "$line" | grep -oE 'dnat (ip )?to [0-9.]+:[0-9]+' | sed -E 's/dnat (ip )?to //')
+                    # 匹配 IPv4 或 IPv6 目标
+                    if echo "$line" | grep -q "dnat ip6 to"; then
+                        # IPv6 格式: dnat ip6 to [xxxx:xxxx:...]:port
+                        TARGET=$(echo "$line" | grep -oE 'dnat ip6 to \[[^\]]+\]:[0-9]+' | sed 's/dnat ip6 to //')
+                    else
+                        # IPv4 格式: dnat ip to x.x.x.x:port
+                        TARGET=$(echo "$line" | grep -oE 'dnat ip to [0-9.]+:[0-9]+' | sed 's/dnat ip to //')
+                    fi
                     BYTES=$(echo "$line" | grep -oE 'bytes [0-9]+' | awk '{print $2}')
                     PACKETS=$(echo "$line" | grep -oE 'packets [0-9]+' | awk '{print $2}')
                     TRAFFIC_FMT=$(format_traffic "${BYTES:-0}")
@@ -1178,6 +1588,111 @@ case $MAIN_ACTION in
             echo ""
         fi
         
+        # 用户态服务统计 (通过 iptables/nftables 统计)
+        echo -e "${CYAN}${BOLD}=== 用户态服务流量 ===${NC}"
+        echo -e "${DIM}(通过 iptables INPUT 链统计)${NC}"
+        echo ""
+        
+        # 收集所有用户态服务的端口
+        USER_PORTS=""
+        
+        # realm 端口
+        if [ -f /etc/realm/config.toml ] && systemctl is-active realm-forward >/dev/null 2>&1; then
+            REALM_PORTS=$(grep -E "^listen" /etc/realm/config.toml 2>/dev/null | grep -oE '[0-9]+$')
+            USER_PORTS="$USER_PORTS $REALM_PORTS"
+            for port in $REALM_PORTS; do
+                # 检查是否已有统计规则
+                if ! iptables -L INPUT -n -v 2>/dev/null | grep -q "dpt:$port.*ACCEPT"; then
+                    # 添加统计规则 (不影响转发，只统计)
+                    iptables -I INPUT -p tcp --dport $port -j ACCEPT 2>/dev/null
+                    iptables -I INPUT -p udp --dport $port -j ACCEPT 2>/dev/null
+                fi
+                # 获取流量
+                TCP_STATS=$(iptables -L INPUT -n -v 2>/dev/null | grep "dpt:$port" | grep tcp | head -1)
+                TCP_BYTES=$(echo "$TCP_STATS" | awk '{print $2}')
+                TCP_PKTS=$(echo "$TCP_STATS" | awk '{print $1}')
+                UDP_STATS=$(iptables -L INPUT -n -v 2>/dev/null | grep "dpt:$port" | grep udp | head -1)
+                UDP_BYTES=$(echo "$UDP_STATS" | awk '{print $2}')
+                # 获取目标
+                TARGET=$(grep -A1 "listen.*:$port" /etc/realm/config.toml 2>/dev/null | grep remote | sed -n 's/.*remote = "\([^"]*\)".*/\1/p')
+                TRAFFIC_FMT=$(format_traffic "${TCP_BYTES:-0}")
+                echo -e "  ${GREEN}realm${NC} :$port -> $TARGET"
+                echo -e "    流量: ${GREEN}${TRAFFIC_FMT}${NC}  包数: ${CYAN}${TCP_PKTS:-0}${NC}"
+            done
+        fi
+        
+        # gost 端口
+        if [ -f /etc/gost/config.yaml ] && systemctl is-active gost-forward >/dev/null 2>&1; then
+            GOST_PORTS=$(grep "addr:" /etc/gost/config.yaml 2>/dev/null | grep -oE ':[0-9]+' | tr -d ':')
+            for port in $GOST_PORTS; do
+                if ! iptables -L INPUT -n -v 2>/dev/null | grep -q "dpt:$port.*ACCEPT"; then
+                    iptables -I INPUT -p tcp --dport $port -j ACCEPT 2>/dev/null
+                fi
+                TCP_STATS=$(iptables -L INPUT -n -v 2>/dev/null | grep "dpt:$port" | grep tcp | head -1)
+                TCP_BYTES=$(echo "$TCP_STATS" | awk '{print $2}')
+                TCP_PKTS=$(echo "$TCP_STATS" | awk '{print $1}')
+                TRAFFIC_FMT=$(format_traffic "${TCP_BYTES:-0}")
+                echo -e "  ${YELLOW}gost${NC} :$port"
+                echo -e "    流量: ${GREEN}${TRAFFIC_FMT}${NC}  包数: ${CYAN}${TCP_PKTS:-0}${NC}"
+            done
+        fi
+        
+        # haproxy 端口
+        if [ -f /etc/haproxy/haproxy.cfg ] && systemctl is-active haproxy >/dev/null 2>&1; then
+            HAPROXY_PORTS=$(grep "bind \*:" /etc/haproxy/haproxy.cfg 2>/dev/null | grep -oE ':[0-9]+' | tr -d ':' | grep -v 8888)
+            for port in $HAPROXY_PORTS; do
+                if ! iptables -L INPUT -n -v 2>/dev/null | grep -q "dpt:$port.*ACCEPT"; then
+                    iptables -I INPUT -p tcp --dport $port -j ACCEPT 2>/dev/null
+                fi
+                TCP_STATS=$(iptables -L INPUT -n -v 2>/dev/null | grep "dpt:$port" | grep tcp | head -1)
+                TCP_BYTES=$(echo "$TCP_STATS" | awk '{print $2}')
+                TCP_PKTS=$(echo "$TCP_STATS" | awk '{print $1}')
+                TRAFFIC_FMT=$(format_traffic "${TCP_BYTES:-0}")
+                echo -e "  ${BLUE}haproxy${NC} :$port"
+                echo -e "    流量: ${GREEN}${TRAFFIC_FMT}${NC}  包数: ${CYAN}${TCP_PKTS:-0}${NC}"
+            done
+        fi
+        
+        # socat 端口
+        SOCAT_SERVICES=$(systemctl list-units --type=service --state=running 2>/dev/null | grep "port-forward-" | awk '{print $1}')
+        if [ -n "$SOCAT_SERVICES" ]; then
+            for svc in $SOCAT_SERVICES; do
+                port=$(echo "$svc" | grep -oE "[0-9]+" | head -1)
+                if [ -n "$port" ]; then
+                    if ! iptables -L INPUT -n -v 2>/dev/null | grep -q "dpt:$port.*ACCEPT"; then
+                        iptables -I INPUT -p tcp --dport $port -j ACCEPT 2>/dev/null
+                    fi
+                    TCP_STATS=$(iptables -L INPUT -n -v 2>/dev/null | grep "dpt:$port" | grep tcp | head -1)
+                    TCP_BYTES=$(echo "$TCP_STATS" | awk '{print $2}')
+                    TCP_PKTS=$(echo "$TCP_STATS" | awk '{print $1}')
+                    TRAFFIC_FMT=$(format_traffic "${TCP_BYTES:-0}")
+                    echo -e "  ${CYAN}socat${NC} :$port"
+                    echo -e "    流量: ${GREEN}${TRAFFIC_FMT}${NC}  包数: ${CYAN}${TCP_PKTS:-0}${NC}"
+                fi
+            done
+        fi
+        
+        # nginx stream 端口
+        if [ -d /etc/nginx/stream.d ] && systemctl is-active nginx >/dev/null 2>&1; then
+            for conf in /etc/nginx/stream.d/port-forward-*.conf; do
+                [ -f "$conf" ] || continue
+                port=$(grep "listen" "$conf" | grep -oE '[0-9]+' | head -1)
+                if [ -n "$port" ]; then
+                    if ! iptables -L INPUT -n -v 2>/dev/null | grep -q "dpt:$port.*ACCEPT"; then
+                        iptables -I INPUT -p tcp --dport $port -j ACCEPT 2>/dev/null
+                    fi
+                    TCP_STATS=$(iptables -L INPUT -n -v 2>/dev/null | grep "dpt:$port" | grep tcp | head -1)
+                    TCP_BYTES=$(echo "$TCP_STATS" | awk '{print $2}')
+                    TCP_PKTS=$(echo "$TCP_STATS" | awk '{print $1}')
+                    TRAFFIC_FMT=$(format_traffic "${TCP_BYTES:-0}")
+                    echo -e "  ${MAGENTA}nginx${NC} :$port"
+                    echo -e "    流量: ${GREEN}${TRAFFIC_FMT}${NC}  包数: ${CYAN}${TCP_PKTS:-0}${NC}"
+                fi
+            done
+        fi
+        
+        echo ""
+        
         # 连接跟踪统计
         echo -e "${CYAN}${BOLD}=== 连接跟踪统计 ===${NC}"
         if [ -f /proc/net/nf_conntrack ]; then
@@ -1205,7 +1720,8 @@ case $MAIN_ACTION in
         done
         
         echo ""
-        echo -e "${YELLOW}提示: 流量统计会在服务重启后重置${NC}"
+        echo -e "${YELLOW}提示: 流量统计会在服务/iptables重启后重置${NC}"
+        echo -e "${DIM}用户态服务流量通过 iptables INPUT 链统计${NC}"
         echo ""
         echo "按回车键返回主菜单..."
         read
@@ -1391,7 +1907,22 @@ esac
 echo -e "${BLUE}请输入转发配置信息：${NC}"
 echo ""
 
+# 检测 IP 地址类型的函数
+detect_ip_type() {
+    local ip=$1
+    # IPv4 检测
+    if [[ $ip =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        echo "ipv4"
+    # IPv6 检测 (包括完整格式和压缩格式)
+    elif [[ $ip =~ ^([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}$ ]] || [[ $ip =~ ^([0-9a-fA-F]{0,4}:){1,7}:$ ]] || [[ $ip =~ ^:(:([0-9a-fA-F]{0,4})){1,7}$ ]] || [[ $ip =~ ^([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$ ]]; then
+        echo "ipv6"
+    else
+        echo "unknown"
+    fi
+}
+
 # 获取目标IP
+IS_IPV6=false
 while true; do
     read -p "$(echo -e "${YELLOW}目标服务器IP/域名: ${NC}")" TARGET_IP
     if [ -z "$TARGET_IP" ]; then
@@ -1399,8 +1930,10 @@ while true; do
         continue
     fi
     
-    # 检查是否为有效的IP地址
-    if [[ $TARGET_IP =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+    IP_TYPE=$(detect_ip_type "$TARGET_IP")
+    
+    # 检查是否为有效的IPv4地址
+    if [ "$IP_TYPE" = "ipv4" ]; then
         # 验证IP地址的每个段是否在0-255范围内
         IFS='.' read -ra IP_PARTS <<< "$TARGET_IP"
         valid_ip=true
@@ -1411,11 +1944,18 @@ while true; do
             fi
         done
         if [ "$valid_ip" = true ]; then
-            echo -e "${GREEN}✅ 有效的IP地址: $TARGET_IP${NC}"
+            echo -e "${GREEN}✅ 有效的IPv4地址: $TARGET_IP${NC}"
+            IS_IPV6=false
             break
         else
             echo -e "${RED}❌ IP地址格式错误，每段应在0-255范围内${NC}"
         fi
+    # 检查是否为有效的IPv6地址
+    elif [ "$IP_TYPE" = "ipv6" ]; then
+        echo -e "${GREEN}✅ 有效的IPv6地址: $TARGET_IP${NC}"
+        IS_IPV6=true
+        echo -e "${YELLOW}⚠️  注意: IPv6 转发仅支持 nftables、socat、gost、realm 方案${NC}"
+        break
     # 检查是否为有效的域名
     elif [[ $TARGET_IP =~ ^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*$ ]]; then
         echo -e "${GREEN}✅ 有效的域名: $TARGET_IP${NC}"
@@ -1425,6 +1965,11 @@ while true; do
             RESOLVED_IP=$(nslookup "$TARGET_IP" 2>/dev/null | grep -A1 "Name:" | grep "Address:" | head -1 | awk '{print $2}' || echo "")
             if [ -n "$RESOLVED_IP" ]; then
                 echo -e "${GREEN}✅ 域名解析成功: $TARGET_IP -> $RESOLVED_IP${NC}"
+                # 检测解析后的 IP 类型
+                if [ "$(detect_ip_type "$RESOLVED_IP")" = "ipv6" ]; then
+                    IS_IPV6=true
+                    echo -e "${YELLOW}⚠️  注意: 域名解析为 IPv6，仅支持 nftables、socat、gost、realm 方案${NC}"
+                fi
             else
                 echo -e "${YELLOW}⚠️  域名解析失败，但将继续使用域名${NC}"
             fi
@@ -1432,85 +1977,286 @@ while true; do
         break
     else
         echo -e "${RED}❌ 请输入有效的IP地址或域名${NC}"
-        echo -e "${YELLOW}IP地址示例: 192.168.1.100${NC}"
+        echo -e "${YELLOW}IPv4示例: 192.168.1.100${NC}"
+        echo -e "${YELLOW}IPv6示例: 2409:871e:2700:100a:6508:120e:5e:a${NC}"
         echo -e "${YELLOW}域名示例: example.com${NC}"
     fi
 done
 
-# 获取目标端口
-while true; do
-    read -p "$(echo -e "${YELLOW}目标端口 [3389]: ${NC}")" TARGET_PORT
-    TARGET_PORT=${TARGET_PORT:-3389}
-    if [[ $TARGET_PORT =~ ^[0-9]+$ ]] && [ $TARGET_PORT -ge 1 ] && [ $TARGET_PORT -le 65535 ]; then
-        break
-    else
-        echo -e "${RED}请输入有效的端口号 (1-65535)${NC}"
-    fi
-done
+# 解析端口映射的函数
+# 支持格式: 单端口(80), 端口范围(80-90), 端口映射(80:8080), 多端口(80,443,8080)
+parse_port_mappings() {
+    local input=$1
+    local mappings=()
+    
+    # 按逗号分割
+    IFS=',' read -ra parts <<< "$input"
+    for part in "${parts[@]}"; do
+        part=$(echo "$part" | tr -d ' ')  # 去除空格
+        
+        if [[ $part =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            # 端口范围: 80-90 (本地和目标端口相同)
+            local start=${BASH_REMATCH[1]}
+            local end=${BASH_REMATCH[2]}
+            for ((p=start; p<=end; p++)); do
+                mappings+=("$p:$p")
+            done
+        elif [[ $part =~ ^([0-9]+):([0-9]+)$ ]]; then
+            # 端口映射: 本地端口:目标端口
+            mappings+=("$part")
+        elif [[ $part =~ ^[0-9]+$ ]]; then
+            # 单端口 (本地和目标端口相同)
+            mappings+=("$part:$part")
+        fi
+    done
+    
+    echo "${mappings[@]}"
+}
 
-# 获取本地监听端口
+# 验证端口是否有效
+validate_port() {
+    local port=$1
+    if [[ $port =~ ^[0-9]+$ ]] && [ $port -ge 1 ] && [ $port -le 65535 ]; then
+        return 0
+    fi
+    return 1
+}
+
+# 获取端口配置
+echo ""
+echo -e "${CYAN}${BOLD}========== 端口配置 ==========${NC}"
+echo -e "${YELLOW}支持的格式：${NC}"
+echo -e "  单端口:     ${BOLD}3389${NC}"
+echo -e "  多端口:     ${BOLD}80,443,8080${NC}"
+echo -e "  端口范围:   ${BOLD}8000-8010${NC}"
+echo -e "  端口映射:   ${BOLD}本地端口:目标端口${NC} (如 ${BOLD}33389:3389${NC})"
+echo -e "  混合格式:   ${BOLD}80,443,8000-8005,33389:3389${NC}"
+echo ""
+
 while true; do
-    read -p "$(echo -e ${YELLOW}本地监听端口 [$TARGET_PORT]: ${NC})" LOCAL_PORT
-    LOCAL_PORT=${LOCAL_PORT:-$TARGET_PORT}
-    if [[ $LOCAL_PORT =~ ^[0-9]+$ ]] && [ $LOCAL_PORT -ge 1 ] && [ $LOCAL_PORT -le 65535 ]; then
-        # 检查端口是否已被占用
+    read -p "$(echo -e "${YELLOW}端口配置 [3389]: ${NC}")" PORT_INPUT
+    PORT_INPUT=${PORT_INPUT:-3389}
+    
+    # 解析端口映射
+    PORT_MAPPINGS=($(parse_port_mappings "$PORT_INPUT"))
+    
+    if [ ${#PORT_MAPPINGS[@]} -eq 0 ]; then
+        echo -e "${RED}无效的端口格式${NC}"
+        continue
+    fi
+    
+    # 验证所有端口
+    all_valid=true
+    for mapping in "${PORT_MAPPINGS[@]}"; do
+        local_p=$(echo "$mapping" | cut -d: -f1)
+        target_p=$(echo "$mapping" | cut -d: -f2)
+        
+        if ! validate_port "$local_p" || ! validate_port "$target_p"; then
+            echo -e "${RED}无效的端口: $mapping (端口范围 1-65535)${NC}"
+            all_valid=false
+            break
+        fi
+    done
+    
+    if [ "$all_valid" = false ]; then
+        continue
+    fi
+    
+    # 显示解析结果
+    echo -e "${GREEN}✅ 将配置 ${#PORT_MAPPINGS[@]} 条转发规则：${NC}"
+    for mapping in "${PORT_MAPPINGS[@]}"; do
+        local_p=$(echo "$mapping" | cut -d: -f1)
+        target_p=$(echo "$mapping" | cut -d: -f2)
+        if [ "$local_p" = "$target_p" ]; then
+            echo -e "   本地 :$local_p -> 目标 :$target_p"
+        else
+            echo -e "   本地 :$local_p -> 目标 :$target_p"
+        fi
+    done
+    
+    # 检查端口占用
+    occupied_ports=()
+    for mapping in "${PORT_MAPPINGS[@]}"; do
+        local_p=$(echo "$mapping" | cut -d: -f1)
         if command -v ss >/dev/null 2>&1; then
-            if ss -tlnp | grep -q ":$LOCAL_PORT "; then
-                echo -e "${YELLOW}⚠️  警告: 端口 $LOCAL_PORT 已被占用${NC}"
-                ss -tlnp | grep ":$LOCAL_PORT " | head -3
-                read -p "$(echo -e ${YELLOW}是否继续使用此端口? [y/N]: ${NC})" CONTINUE_PORT
-                if [[ ! $CONTINUE_PORT =~ ^[Yy]$ ]]; then
-                    continue
-                fi
+            if ss -tlnp 2>/dev/null | grep -q ":$local_p "; then
+                occupied_ports+=("$local_p")
             fi
         elif command -v netstat >/dev/null 2>&1; then
-            if netstat -tlnp 2>/dev/null | grep -q ":$LOCAL_PORT "; then
-                echo -e "${YELLOW}⚠️  警告: 端口 $LOCAL_PORT 已被占用${NC}"
-                netstat -tlnp 2>/dev/null | grep ":$LOCAL_PORT " | head -3
-                read -p "$(echo -e ${YELLOW}是否继续使用此端口? [y/N]: ${NC})" CONTINUE_PORT
-                if [[ ! $CONTINUE_PORT =~ ^[Yy]$ ]]; then
-                    continue
-                fi
+            if netstat -tlnp 2>/dev/null | grep -q ":$local_p "; then
+                occupied_ports+=("$local_p")
             fi
         fi
-        break
-    else
-        echo -e "${RED}请输入有效的端口号 (1-65535)${NC}"
+    done
+    
+    if [ ${#occupied_ports[@]} -gt 0 ]; then
+        echo -e "${YELLOW}⚠️  警告: 以下端口已被占用: ${occupied_ports[*]}${NC}"
+        read -p "$(echo -e ${YELLOW}是否继续? [y/N]: ${NC})" CONTINUE_PORT
+        if [[ ! $CONTINUE_PORT =~ ^[Yy]$ ]]; then
+            continue
+        fi
     fi
+    
+    break
 done
 
 # 选择转发方案
 echo ""
 echo -e "${CYAN}${BOLD}========== 转发方案对比 ==========${NC}"
 echo ""
-echo -e "${YELLOW}方案选择：${NC}"
-echo -e "1) ${GREEN}iptables DNAT${NC}   - 延迟: 低      | 适用: ${BOLD}游戏/RDP/VNC${NC}"
-echo -e "2) ${MAGENTA}nftables DNAT${NC}   - 延迟: 低      | 适用: ${BOLD}新系统/高性能${NC}"
-echo -e "3) ${BLUE}HAProxy${NC}         - 延迟: 较低    | 适用: ${BOLD}Web服务/负载均衡${NC}"
-echo -e "4) ${CYAN}socat${NC}           - 延迟: 较低    | 适用: ${BOLD}通用TCP转发${NC}"
-echo -e "5) ${YELLOW}gost${NC}            - 延迟: 中等    | 适用: ${BOLD}加密代理/多协议${NC}"
-echo -e "6) ${MAGENTA}realm${NC}           - 延迟: 较低    | 适用: ${BOLD}高并发场景${NC}"
-echo -e "7) ${BLUE}rinetd${NC}          - 延迟: 较低    | 适用: ${BOLD}多端口转发${NC}"
-echo -e "8) ${CYAN}nginx stream${NC}    - 延迟: 较低    | 适用: ${BOLD}Web场景/SSL${NC}"
-echo ""
-echo -e "${CYAN}性能: ${GREEN}iptables/nftables${NC} > ${MAGENTA}realm${NC} > ${BLUE}HAProxy/nginx${NC} > ${CYAN}socat/rinetd${NC} > ${YELLOW}gost${NC}"
-echo -e "${CYAN}功能: ${YELLOW}gost${NC} > ${BLUE}nginx/HAProxy${NC} > ${MAGENTA}realm${NC} > ${CYAN}socat/rinetd${NC} > ${GREEN}iptables/nftables${NC}"
+
+# 检测本机网络环境
+detect_local_network
+
+# 判断公网情况
+HAS_PUBLIC_V4=false
+HAS_PUBLIC_V6=false
+[ "$LOCAL_IPV4_TYPE" = "public" ] && HAS_PUBLIC_V4=true
+[ "$LOCAL_IPV6_TYPE" = "public" ] && HAS_PUBLIC_V6=true
+
+# 显示本机网络状态
+echo -e "${CYAN}本机网络环境:${NC}"
+if [ "$LOCAL_HAS_IPV4" = true ]; then
+    if [ "$LOCAL_IPV4_TYPE" = "public" ]; then
+        echo -e "  IPv4: ${GREEN}✓ $LOCAL_IPV4 (公网)${NC}"
+    else
+        echo -e "  IPv4: ${YELLOW}✓ $LOCAL_IPV4 (内网)${NC}"
+    fi
+else
+    echo -e "  IPv4: ${RED}✗ 无${NC}"
+fi
+if [ "$LOCAL_HAS_IPV6" = true ]; then
+    if [ "$LOCAL_IPV6_TYPE" = "public" ]; then
+        echo -e "  IPv6: ${GREEN}✓ $LOCAL_IPV6 (公网)${NC}"
+    else
+        echo -e "  IPv6: ${YELLOW}✓ $LOCAL_IPV6 (内网)${NC}"
+    fi
+else
+    echo -e "  IPv6: ${DIM}✗ 无${NC}"
+fi
 echo ""
 
-while true; do
-    read -p "$(echo -e ${YELLOW}请选择方案 [1]: ${NC})" FORWARD_METHOD
-    FORWARD_METHOD=${FORWARD_METHOD:-1}
-    if [[ $FORWARD_METHOD =~ ^[1-8]$ ]]; then
-        break
+# 判断本机是否只有 IPv6 公网
+LOCAL_ONLY_IPV6=false
+if [ "$HAS_PUBLIC_V6" = true ] && [ "$HAS_PUBLIC_V4" = false ]; then
+    LOCAL_ONLY_IPV6=true
+    echo -e "${YELLOW}⚠️  本机仅有 IPv6 公网出口${NC}"
+    echo ""
+fi
+
+# 根据目标地址类型和本机网络显示方案
+echo -e "${YELLOW}方案选择：${NC}"
+echo ""
+
+# 判断各方案的可用性
+# iptables: 本机需要对应的公网 IP 版本
+if [ "$IS_IPV6" = true ]; then
+    if [ "$HAS_PUBLIC_V6" = true ]; then
+        echo -e "1) ${GREEN}iptables DNAT${NC}   - 延迟: 低  | ${GREEN}✓ 支持 (ip6tables)${NC}"
+        IPTABLES_OK=true
     else
-        echo -e "${RED}请输入 1-8 之间的数字${NC}"
+        echo -e "1) ${DIM}iptables DNAT${NC}   - ${RED}✗ 本机无公网 IPv6${NC}"
+        IPTABLES_OK=false
     fi
+else
+    if [ "$HAS_PUBLIC_V4" = true ]; then
+        echo -e "1) ${GREEN}iptables DNAT${NC}   - 延迟: 低  | ${GREEN}✓ 支持${NC}"
+        IPTABLES_OK=true
+    elif [ "$LOCAL_HAS_IPV4" = true ]; then
+        echo -e "1) ${YELLOW}iptables DNAT${NC}   - 延迟: 低  | ${YELLOW}⚠ 内网可用${NC}"
+        IPTABLES_OK=true
+    else
+        echo -e "1) ${DIM}iptables DNAT${NC}   - ${RED}✗ 本机无 IPv4${NC}"
+        IPTABLES_OK=false
+    fi
+fi
+
+# nftables: 支持双栈
+echo -e "2) ${MAGENTA}nftables DNAT${NC}   - 延迟: 低  | ${GREEN}✓ 支持${NC}"
+NFTABLES_OK=true
+
+# HAProxy: 支持双栈
+echo -e "3) ${BLUE}HAProxy${NC}         - 延迟: 较低 | ${GREEN}✓ 支持${NC}"
+HAPROXY_OK=true
+
+# socat: 支持双栈
+echo -e "4) ${CYAN}socat${NC}           - 延迟: 较低 | ${GREEN}✓ 支持${NC}"
+SOCAT_OK=true
+
+# gost: 支持双栈
+echo -e "5) ${YELLOW}gost${NC}            - 延迟: 中等 | ${GREEN}✓ 支持${NC}"
+GOST_OK=true
+
+# realm: 支持双栈
+echo -e "6) ${MAGENTA}realm${NC}           - 延迟: 较低 | ${GREEN}✓ 支持${NC}"
+REALM_OK=true
+
+# rinetd: 不支持 IPv6
+if [ "$IS_IPV6" = true ]; then
+    echo -e "7) ${DIM}rinetd${NC}          - ${RED}✗ 不支持 IPv6 目标${NC}"
+    RINETD_OK=false
+else
+    echo -e "7) ${BLUE}rinetd${NC}          - 延迟: 较低 | ${GREEN}✓ 支持${NC}"
+    RINETD_OK=true
+fi
+
+# nginx stream: 支持双栈
+echo -e "8) ${CYAN}nginx stream${NC}    - 延迟: 较低 | ${GREEN}✓ 支持${NC}"
+NGINX_OK=true
+
+echo ""
+echo -e "${DIM}所有方案均支持流量统计 (菜单选项 6)${NC}"
+echo -e "${CYAN}性能: ${GREEN}iptables/nftables${NC} > ${MAGENTA}realm${NC} > ${BLUE}HAProxy/nginx${NC} > ${CYAN}socat/rinetd${NC} > ${YELLOW}gost${NC}"
+echo ""
+
+# 构建可用方案列表
+AVAILABLE_METHODS=""
+[ "$IPTABLES_OK" = true ] && AVAILABLE_METHODS="${AVAILABLE_METHODS}1"
+[ "$NFTABLES_OK" = true ] && AVAILABLE_METHODS="${AVAILABLE_METHODS}2"
+[ "$HAPROXY_OK" = true ] && AVAILABLE_METHODS="${AVAILABLE_METHODS}3"
+[ "$SOCAT_OK" = true ] && AVAILABLE_METHODS="${AVAILABLE_METHODS}4"
+[ "$GOST_OK" = true ] && AVAILABLE_METHODS="${AVAILABLE_METHODS}5"
+[ "$REALM_OK" = true ] && AVAILABLE_METHODS="${AVAILABLE_METHODS}6"
+[ "$RINETD_OK" = true ] && AVAILABLE_METHODS="${AVAILABLE_METHODS}7"
+[ "$NGINX_OK" = true ] && AVAILABLE_METHODS="${AVAILABLE_METHODS}8"
+
+# 默认选择
+if [ "$NFTABLES_OK" = true ]; then
+    DEFAULT_METHOD=2
+elif [ "$IPTABLES_OK" = true ]; then
+    DEFAULT_METHOD=1
+else
+    DEFAULT_METHOD=4  # socat 作为备选
+fi
+
+while true; do
+    read -p "$(echo -e ${YELLOW}请选择方案 [$DEFAULT_METHOD]: ${NC})" FORWARD_METHOD
+    FORWARD_METHOD=${FORWARD_METHOD:-$DEFAULT_METHOD}
+    
+    # 检查选择是否有效
+    if [[ ! $FORWARD_METHOD =~ ^[1-8]$ ]]; then
+        echo -e "${RED}请输入 1-8 之间的数字${NC}"
+        continue
+    fi
+    
+    # 检查选择的方案是否可用
+    case $FORWARD_METHOD in
+        1) [ "$IPTABLES_OK" = false ] && echo -e "${RED}iptables 不可用，请选择其他方案${NC}" && continue ;;
+        7) [ "$RINETD_OK" = false ] && echo -e "${RED}rinetd 不支持 IPv6 目标，请选择其他方案${NC}" && continue ;;
+    esac
+    
+    break
 done
 
 echo ""
 echo -e "${CYAN}配置确认：${NC}"
-echo -e "目标服务器: ${BOLD}$TARGET_IP:$TARGET_PORT${NC}"
-echo -e "本地监听: ${BOLD}0.0.0.0:$LOCAL_PORT${NC}"
+echo -e "目标服务器: ${BOLD}$TARGET_IP${NC}"
+echo -e "端口映射: ${BOLD}${#PORT_MAPPINGS[@]} 条规则${NC}"
+for mapping in "${PORT_MAPPINGS[@]}"; do
+    local_p=$(echo "$mapping" | cut -d: -f1)
+    target_p=$(echo "$mapping" | cut -d: -f2)
+    echo -e "  本地 :$local_p -> 目标 $TARGET_IP:$target_p"
+done
 case $FORWARD_METHOD in
     1) echo -e "转发方案: ${BOLD}iptables DNAT${NC}" ;;
     2) echo -e "转发方案: ${BOLD}nftables DNAT${NC}" ;;
@@ -1555,11 +2301,19 @@ case $FORWARD_METHOD in
 esac
 
 # 创建备份说明文件
+PORTS_INFO=""
+for mapping in "${PORT_MAPPINGS[@]}"; do
+    local_p=$(echo "$mapping" | cut -d: -f1)
+    target_p=$(echo "$mapping" | cut -d: -f2)
+    PORTS_INFO="$PORTS_INFO\n  :$local_p -> :$target_p"
+done
+
 cat > "$BACKUP_DIR/backup_info.txt" << EOF
 备份时间: $(date)
 转发方案: $METHOD_NAME
-目标地址: $TARGET_IP:$TARGET_PORT
-本地端口: $LOCAL_PORT
+目标地址: $TARGET_IP
+端口映射: ${#PORT_MAPPINGS[@]} 条规则
+$(echo -e "$PORTS_INFO")
 EOF
 
 # 应用网络性能优化内核参数
@@ -1623,63 +2377,66 @@ sysctl -p >/dev/null 2>&1
 echo -e "${GREEN}内核优化完成${NC}"
 
 echo -e "${BLUE}[步骤2/4] 清理同类型服务...${NC}"
-# 只清理当前选择的方案类型，不影响其他方案
+# 只清理当前选择的方案类型中相同端口的规则，不影响其他端口
 case $FORWARD_METHOD in
     1)
         # iptables - 只清理相同端口的规则
         IPTABLES_CMD=$(get_iptables_cmd)
-        $IPTABLES_CMD -t nat -S PREROUTING 2>/dev/null | grep "\-\-dport $LOCAL_PORT " | sed 's/-A/-D/' | while read rule; do
-            $IPTABLES_CMD -t nat $rule 2>/dev/null || true
+        for mapping in "${PORT_MAPPINGS[@]}"; do
+            LP=$(echo "$mapping" | cut -d: -f1)
+            $IPTABLES_CMD -t nat -S PREROUTING 2>/dev/null | grep "\-\-dport $LP " | sed 's/-A/-D/' | while read rule; do
+                $IPTABLES_CMD -t nat $rule 2>/dev/null || true
+            done
         done
-        echo -e "${YELLOW}已清理 iptables 端口 $LOCAL_PORT 的旧规则${NC}"
+        echo -e "${YELLOW}已清理 iptables 相关端口的旧规则${NC}"
         ;;
     2)
         # nftables - 清理相同端口的规则
         if command -v nft >/dev/null 2>&1; then
-            # 删除包含该端口的规则
-            nft list chain inet port_forward prerouting 2>/dev/null | grep "dport $LOCAL_PORT" | while read line; do
-                HANDLE=$(echo "$line" | grep -oE 'handle [0-9]+' | awk '{print $2}')
-                if [ -n "$HANDLE" ]; then
-                    nft delete rule inet port_forward prerouting handle $HANDLE 2>/dev/null || true
-                fi
+            for mapping in "${PORT_MAPPINGS[@]}"; do
+                LP=$(echo "$mapping" | cut -d: -f1)
+                # 删除包含该端口的规则
+                nft -a list chain inet port_forward prerouting 2>/dev/null | grep "dport $LP " | while read line; do
+                    HANDLE=$(echo "$line" | grep -oE 'handle [0-9]+' | awk '{print $2}')
+                    if [ -n "$HANDLE" ]; then
+                        nft delete rule inet port_forward prerouting handle $HANDLE 2>/dev/null || true
+                    fi
+                done
             done
         fi
-        echo -e "${YELLOW}已清理 nftables 端口 $LOCAL_PORT 的旧规则${NC}"
+        echo -e "${YELLOW}已清理 nftables 相关端口的旧规则${NC}"
         ;;
     3)
-        # HAProxy
-        systemctl stop haproxy 2>/dev/null || true
-        echo -e "${YELLOW}已停止 HAProxy${NC}"
+        # HAProxy - 不停止服务，只更新配置（追加模式）
+        echo -e "${YELLOW}HAProxy 将追加新规则${NC}"
         ;;
     4)
-        # socat
-        systemctl stop port-forward 2>/dev/null || true
-        pkill -f "socat.*$LOCAL_PORT" 2>/dev/null || true
-        echo -e "${YELLOW}已停止 socat${NC}"
+        # socat - 只停止相同端口的服务
+        for mapping in "${PORT_MAPPINGS[@]}"; do
+            LP=$(echo "$mapping" | cut -d: -f1)
+            systemctl stop port-forward-${LP} 2>/dev/null || true
+        done
+        echo -e "${YELLOW}已停止相关端口的 socat 服务${NC}"
         ;;
     5)
-        # gost
-        systemctl stop gost-forward 2>/dev/null || true
-        pkill -f "gost.*$LOCAL_PORT" 2>/dev/null || true
-        echo -e "${YELLOW}已停止 gost${NC}"
+        # gost - 追加模式，不停止现有服务
+        echo -e "${YELLOW}gost 将追加新规则${NC}"
         ;;
     6)
-        # realm
-        systemctl stop realm-forward 2>/dev/null || true
-        pkill -f "realm.*$LOCAL_PORT" 2>/dev/null || true
-        echo -e "${YELLOW}已停止 realm${NC}"
+        # realm - 追加模式，不停止现有服务
+        echo -e "${YELLOW}realm 将追加新规则${NC}"
         ;;
     7)
-        # rinetd
-        systemctl stop rinetd 2>/dev/null || true
-        echo -e "${YELLOW}已停止 rinetd${NC}"
+        # rinetd - 追加模式（注意：rinetd 不支持 IPv6）
+        echo -e "${YELLOW}rinetd 将追加新规则${NC}"
         ;;
     8)
-        # nginx
-        # nginx 不完全停止，只移除当前端口的 stream 配置
-        rm -f /etc/nginx/stream.d/port-forward-${LOCAL_PORT}.conf 2>/dev/null || true
-        nginx -s reload 2>/dev/null || true
-        echo -e "${YELLOW}已清理 nginx stream 端口 $LOCAL_PORT 配置${NC}"
+        # nginx - 只移除当前端口的 stream 配置
+        for mapping in "${PORT_MAPPINGS[@]}"; do
+            LP=$(echo "$mapping" | cut -d: -f1)
+            rm -f /etc/nginx/stream.d/port-forward-${LP}.conf 2>/dev/null || true
+        done
+        echo -e "${YELLOW}已清理 nginx stream 相关端口配置${NC}"
         ;;
 esac
 
@@ -1687,8 +2444,8 @@ echo -e "${BLUE}[步骤3/4] 部署转发服务...${NC}"
 
 case $FORWARD_METHOD in
     1)
-        # iptables DNAT - 完整配置（包含本地访问支持）
-        echo -e "${YELLOW}配置iptables DNAT转发...${NC}"
+        # iptables/ip6tables DNAT - 支持 IPv4 和 IPv6
+        echo -e "${YELLOW}配置 iptables DNAT 转发...${NC}"
         echo ""
         
         # 识别系统类型
@@ -1701,6 +2458,20 @@ case $FORWARD_METHOD in
         fi
         
         echo -e "${CYAN}检测到系统: ${BOLD}$OS_TYPE${NC}"
+        
+        # 根据目标地址类型选择命令
+        if [ "$IS_IPV6" = true ]; then
+            echo -e "${CYAN}目标类型: ${BOLD}IPv6${NC}"
+            IPTABLES_CMD="ip6tables"
+            # 检查 ip6tables 是否可用
+            if ! command -v ip6tables >/dev/null 2>&1; then
+                echo -e "${RED}ip6tables 未安装，请先安装 iptables${NC}"
+                exit 1
+            fi
+        else
+            echo -e "${CYAN}目标类型: ${BOLD}IPv4${NC}"
+            IPTABLES_CMD=$(get_iptables_cmd)
+        fi
         echo ""
         
         # Ubuntu: 先安装 iptables-persistent
@@ -1715,38 +2486,72 @@ case $FORWARD_METHOD in
         
         # 1. 启用IP转发
         echo -e "${CYAN}[1/6] 启用IP转发${NC}"
-        echo 1 > /proc/sys/net/ipv4/ip_forward
-        if ! grep -q "^net.ipv4.ip_forward = 1" /etc/sysctl.conf; then
-            echo "net.ipv4.ip_forward = 1" >> /etc/sysctl.conf
+        if [ "$IS_IPV6" = true ]; then
+            echo 1 > /proc/sys/net/ipv6/conf/all/forwarding
+            if ! grep -q "^net.ipv6.conf.all.forwarding = 1" /etc/sysctl.conf; then
+                echo "net.ipv6.conf.all.forwarding = 1" >> /etc/sysctl.conf
+            fi
+        else
+            echo 1 > /proc/sys/net/ipv4/ip_forward
+            if ! grep -q "^net.ipv4.ip_forward = 1" /etc/sysctl.conf; then
+                echo "net.ipv4.ip_forward = 1" >> /etc/sysctl.conf
+            fi
         fi
         sysctl -p >/dev/null 2>&1
         echo -e "${GREEN}✓ 完成${NC}"
         
-        # 获取正确的 iptables 命令（与验证时保持一致）
-        IPTABLES_CMD=$(get_iptables_cmd)
-        
         # 2. 添加DNAT规则（外部访问）
         echo -e "${CYAN}[2/6] 添加DNAT规则（外部访问）${NC}"
-        $IPTABLES_CMD -t nat -A PREROUTING -p tcp --dport $LOCAL_PORT -j DNAT --to-destination $TARGET_IP:$TARGET_PORT
+        for mapping in "${PORT_MAPPINGS[@]}"; do
+            LOCAL_PORT=$(echo "$mapping" | cut -d: -f1)
+            TARGET_PORT=$(echo "$mapping" | cut -d: -f2)
+            if [ "$IS_IPV6" = true ]; then
+                $IPTABLES_CMD -t nat -A PREROUTING -p tcp --dport $LOCAL_PORT -j DNAT --to-destination [$TARGET_IP]:$TARGET_PORT
+            else
+                $IPTABLES_CMD -t nat -A PREROUTING -p tcp --dport $LOCAL_PORT -j DNAT --to-destination $TARGET_IP:$TARGET_PORT
+            fi
+            echo -e "  ✓ :$LOCAL_PORT -> $TARGET_IP:$TARGET_PORT"
+        done
         echo -e "${GREEN}✓ 完成${NC}"
         
         # 3. 添加MASQUERADE规则
         echo -e "${CYAN}[3/6] 添加MASQUERADE规则${NC}"
-        $IPTABLES_CMD -t nat -A POSTROUTING -p tcp -d $TARGET_IP --dport $TARGET_PORT -j MASQUERADE
+        for mapping in "${PORT_MAPPINGS[@]}"; do
+            TARGET_PORT=$(echo "$mapping" | cut -d: -f2)
+            $IPTABLES_CMD -t nat -A POSTROUTING -p tcp -d $TARGET_IP --dport $TARGET_PORT -j MASQUERADE
+        done
         echo -e "${GREEN}✓ 完成${NC}"
         
         # 4. 添加OUTPUT规则（本地访问支持）
         echo -e "${CYAN}[4/6] 添加OUTPUT规则（本地访问支持）${NC}"
-        LOCAL_IP=$(hostname -I | awk '{print $1}')
-        $IPTABLES_CMD -t nat -A OUTPUT -p tcp --dport $LOCAL_PORT -d $LOCAL_IP -j DNAT --to-destination $TARGET_IP:$TARGET_PORT 2>/dev/null || true
-        $IPTABLES_CMD -t nat -A OUTPUT -p tcp --dport $LOCAL_PORT -d 127.0.0.1 -j DNAT --to-destination $TARGET_IP:$TARGET_PORT 2>/dev/null || true
-        $IPTABLES_CMD -t nat -A POSTROUTING -p tcp -d $TARGET_IP --dport $TARGET_PORT -s $LOCAL_IP -j MASQUERADE 2>/dev/null || true
+        if [ "$IS_IPV6" = true ]; then
+            LOCAL_IP=$(ip -6 addr show scope global | grep inet6 | awk '{print $2}' | cut -d/ -f1 | head -1)
+        else
+            LOCAL_IP=$(hostname -I | awk '{print $1}')
+        fi
+        for mapping in "${PORT_MAPPINGS[@]}"; do
+            LOCAL_PORT=$(echo "$mapping" | cut -d: -f1)
+            TARGET_PORT=$(echo "$mapping" | cut -d: -f2)
+            if [ "$IS_IPV6" = true ]; then
+                $IPTABLES_CMD -t nat -A OUTPUT -p tcp --dport $LOCAL_PORT -d $LOCAL_IP -j DNAT --to-destination [$TARGET_IP]:$TARGET_PORT 2>/dev/null || true
+                $IPTABLES_CMD -t nat -A OUTPUT -p tcp --dport $LOCAL_PORT -d ::1 -j DNAT --to-destination [$TARGET_IP]:$TARGET_PORT 2>/dev/null || true
+            else
+                $IPTABLES_CMD -t nat -A OUTPUT -p tcp --dport $LOCAL_PORT -d $LOCAL_IP -j DNAT --to-destination $TARGET_IP:$TARGET_PORT 2>/dev/null || true
+                $IPTABLES_CMD -t nat -A OUTPUT -p tcp --dport $LOCAL_PORT -d 127.0.0.1 -j DNAT --to-destination $TARGET_IP:$TARGET_PORT 2>/dev/null || true
+            fi
+            $IPTABLES_CMD -t nat -A POSTROUTING -p tcp -d $TARGET_IP --dport $TARGET_PORT -j MASQUERADE 2>/dev/null || true
+            $IPTABLES_CMD -t nat -A OUTPUT -p tcp --dport $LOCAL_PORT -d 127.0.0.1 -j DNAT --to-destination $TARGET_IP:$TARGET_PORT 2>/dev/null || true
+            $IPTABLES_CMD -t nat -A POSTROUTING -p tcp -d $TARGET_IP --dport $TARGET_PORT -s $LOCAL_IP -j MASQUERADE 2>/dev/null || true
+        done
         echo -e "${GREEN}✓ 完成${NC}"
         
         # 5. 添加FORWARD规则（连接跟踪优化）
         echo -e "${CYAN}[5/6] 添加FORWARD规则${NC}"
-        $IPTABLES_CMD -A FORWARD -p tcp -d $TARGET_IP --dport $TARGET_PORT -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
-        $IPTABLES_CMD -A FORWARD -p tcp -s $TARGET_IP --sport $TARGET_PORT -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+        for mapping in "${PORT_MAPPINGS[@]}"; do
+            TARGET_PORT=$(echo "$mapping" | cut -d: -f2)
+            $IPTABLES_CMD -A FORWARD -p tcp -d $TARGET_IP --dport $TARGET_PORT -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+            $IPTABLES_CMD -A FORWARD -p tcp -s $TARGET_IP --sport $TARGET_PORT -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+        done
         echo -e "${GREEN}✓ 完成${NC}"
         
         # 6. 关闭反向路径过滤
@@ -1778,7 +2583,12 @@ case $FORWARD_METHOD in
         echo -e "${GREEN}${BOLD}===========================================${NC}"
         echo -e "${GREEN}${BOLD}  iptables DNAT 配置完成！${NC}"
         echo -e "${GREEN}${BOLD}===========================================${NC}"
-        echo -e "${CYAN}转发: ${BOLD}$LOCAL_PORT -> $TARGET_IP:$TARGET_PORT${NC}"
+        echo -e "${CYAN}已配置 ${#PORT_MAPPINGS[@]} 条转发规则${NC}"
+        for mapping in "${PORT_MAPPINGS[@]}"; do
+            local_p=$(echo "$mapping" | cut -d: -f1)
+            target_p=$(echo "$mapping" | cut -d: -f2)
+            echo -e "  :$local_p -> $TARGET_IP:$target_p"
+        done
         echo -e "${GREEN}${BOLD}===========================================${NC}"
         ;;
         
@@ -1810,6 +2620,13 @@ case $FORWARD_METHOD in
         if ! grep -q "^net.ipv4.ip_forward = 1" /etc/sysctl.conf; then
             echo "net.ipv4.ip_forward = 1" >> /etc/sysctl.conf
         fi
+        # 如果是 IPv6，也启用 IPv6 转发
+        if [ "$IS_IPV6" = true ]; then
+            echo 1 > /proc/sys/net/ipv6/conf/all/forwarding
+            if ! grep -q "^net.ipv6.conf.all.forwarding = 1" /etc/sysctl.conf; then
+                echo "net.ipv6.conf.all.forwarding = 1" >> /etc/sysctl.conf
+            fi
+        fi
         sysctl -p >/dev/null 2>&1
         echo -e "${GREEN}✓ 完成${NC}"
         
@@ -1833,16 +2650,33 @@ case $FORWARD_METHOD in
         # 3. 添加转发规则（带流量统计）
         echo -e "${CYAN}[3/4] 添加转发规则${NC}"
         
-        # DNAT 规则 (带 counter 用于流量统计)
-        # 在 inet 表中必须指定 ip 地址族
-        nft add rule inet port_forward prerouting ip protocol tcp tcp dport $LOCAL_PORT counter dnat ip to $TARGET_IP:$TARGET_PORT
-        
-        # MASQUERADE 规则
-        nft add rule inet port_forward postrouting ip daddr $TARGET_IP tcp dport $TARGET_PORT counter masquerade
-        
-        # FORWARD 规则
-        nft add rule inet port_forward forward ip daddr $TARGET_IP tcp dport $TARGET_PORT ct state new,established,related counter accept 2>/dev/null || true
-        nft add rule inet port_forward forward ip saddr $TARGET_IP tcp sport $TARGET_PORT ct state established,related counter accept 2>/dev/null || true
+        for mapping in "${PORT_MAPPINGS[@]}"; do
+            LOCAL_PORT=$(echo "$mapping" | cut -d: -f1)
+            TARGET_PORT=$(echo "$mapping" | cut -d: -f2)
+            
+            if [ "$IS_IPV6" = true ]; then
+                # IPv6 DNAT 规则
+                nft add rule inet port_forward prerouting ip6 nexthdr tcp tcp dport $LOCAL_PORT counter dnat ip6 to [$TARGET_IP]:$TARGET_PORT
+                
+                # IPv6 MASQUERADE 规则
+                nft add rule inet port_forward postrouting ip6 daddr $TARGET_IP tcp dport $TARGET_PORT counter masquerade
+                
+                # IPv6 FORWARD 规则
+                nft add rule inet port_forward forward ip6 daddr $TARGET_IP tcp dport $TARGET_PORT ct state new,established,related counter accept 2>/dev/null || true
+                nft add rule inet port_forward forward ip6 saddr $TARGET_IP tcp sport $TARGET_PORT ct state established,related counter accept 2>/dev/null || true
+            else
+                # IPv4 DNAT 规则 (带 counter 用于流量统计)
+                nft add rule inet port_forward prerouting ip protocol tcp tcp dport $LOCAL_PORT counter dnat ip to $TARGET_IP:$TARGET_PORT
+                
+                # IPv4 MASQUERADE 规则
+                nft add rule inet port_forward postrouting ip daddr $TARGET_IP tcp dport $TARGET_PORT counter masquerade
+                
+                # IPv4 FORWARD 规则
+                nft add rule inet port_forward forward ip daddr $TARGET_IP tcp dport $TARGET_PORT ct state new,established,related counter accept 2>/dev/null || true
+                nft add rule inet port_forward forward ip saddr $TARGET_IP tcp sport $TARGET_PORT ct state established,related counter accept 2>/dev/null || true
+            fi
+            echo -e "  ✓ :$LOCAL_PORT -> $TARGET_IP:$TARGET_PORT"
+        done
         
         echo -e "${GREEN}✓ 完成${NC}"
         
@@ -1865,25 +2699,20 @@ case $FORWARD_METHOD in
         echo -e "${GREEN}${BOLD}===========================================${NC}"
         echo -e "${GREEN}${BOLD}  nftables DNAT 配置完成！${NC}"
         echo -e "${GREEN}${BOLD}===========================================${NC}"
-        echo -e "${CYAN}转发: ${BOLD}$LOCAL_PORT -> $TARGET_IP:$TARGET_PORT${NC}"
+        echo -e "${CYAN}已配置 ${#PORT_MAPPINGS[@]} 条转发规则${NC}"
+        for mapping in "${PORT_MAPPINGS[@]}"; do
+            local_p=$(echo "$mapping" | cut -d: -f1)
+            target_p=$(echo "$mapping" | cut -d: -f2)
+            echo -e "  :$local_p -> $TARGET_IP:$target_p"
+        done
         echo -e "${YELLOW}查看规则: nft list table inet port_forward${NC}"
         echo -e "${YELLOW}流量统计: 选择菜单选项 6${NC}"
         echo -e "${GREEN}${BOLD}===========================================${NC}"
         ;;
         
     3)
-        # HAProxy优化版
+        # HAProxy优化版 - 支持追加模式
         echo -e "${YELLOW}配置HAProxy优化转发...${NC}"
-        
-        # 询问是否启用Web管理界面
-        echo ""
-        read -p "$(echo -e ${YELLOW}是否启用Web统计页面? [y/N]: ${NC})" ENABLE_WEB
-        ENABLE_WEB=${ENABLE_WEB:-N}
-        
-        # 只有启用Web界面时才生成随机密码
-        if [[ $ENABLE_WEB =~ ^[Yy]$ ]]; then
-            HAPROXY_PASSWORD=$(generate_password 16)
-        fi
         
         # 检查并安装HAProxy
         if ! command -v haproxy >/dev/null 2>&1; then
@@ -1894,12 +2723,28 @@ case $FORWARD_METHOD in
             fi
         fi
         
-        # 创建HAProxy配置
-        cat > /etc/haproxy/haproxy.cfg << EOF
+        # 检查是否已有配置文件
+        HAPROXY_CONFIG="/etc/haproxy/haproxy.cfg"
+        if [ -f "$HAPROXY_CONFIG" ] && grep -q "port_frontend_" "$HAPROXY_CONFIG"; then
+            echo -e "${GREEN}检测到现有 HAProxy 配置，将追加新规则${NC}"
+            HAPROXY_APPEND_MODE=true
+        else
+            HAPROXY_APPEND_MODE=false
+            # 询问是否启用Web管理界面
+            echo ""
+            read -p "$(echo -e ${YELLOW}是否启用Web统计页面? [y/N]: ${NC})" ENABLE_WEB
+            ENABLE_WEB=${ENABLE_WEB:-N}
+            
+            # 只有启用Web界面时才生成随机密码
+            if [[ $ENABLE_WEB =~ ^[Yy]$ ]]; then
+                HAPROXY_PASSWORD=$(generate_password 16)
+            fi
+            
+            # 创建HAProxy基础配置
+            cat > "$HAPROXY_CONFIG" << EOF
 global
     daemon
     maxconn 65535
-    # 性能优化
     tune.rcvbuf.client 4194304
     tune.rcvbuf.server 4194304
     tune.sndbuf.client 4194304
@@ -1917,25 +2762,46 @@ defaults
     option tcp-smart-connect
     option dontlognull
     retries 1
-    
-    # TCP优化
     option clitcpka
     option srvtcpka
+EOF
+        fi
 
-# 高性能转发
-frontend port_frontend
+        # 为每个端口添加 frontend 和 backend（先删除同端口的旧配置）
+        for mapping in "${PORT_MAPPINGS[@]}"; do
+            LOCAL_PORT=$(echo "$mapping" | cut -d: -f1)
+            TARGET_PORT=$(echo "$mapping" | cut -d: -f2)
+            
+            # 删除该端口的旧配置块
+            if [ "$HAPROXY_APPEND_MODE" = true ]; then
+                sed -i "/^# 端口转发: $LOCAL_PORT ->/,/^# 端口转发:/{ /^# 端口转发: $LOCAL_PORT ->/d; /^frontend port_frontend_$LOCAL_PORT/,/^$/d; /^backend port_backend_$LOCAL_PORT/,/^$/d; }" "$HAPROXY_CONFIG"
+            fi
+            
+            # IPv6 地址需要用方括号包裹
+            if [ "$IS_IPV6" = true ]; then
+                HAPROXY_TARGET="[$TARGET_IP]:$TARGET_PORT"
+            else
+                HAPROXY_TARGET="$TARGET_IP:$TARGET_PORT"
+            fi
+            
+            cat >> "$HAPROXY_CONFIG" << EOF
+
+# 端口转发: $LOCAL_PORT -> $TARGET_IP:$TARGET_PORT
+frontend port_frontend_$LOCAL_PORT
     bind *:$LOCAL_PORT
+    bind [::]:$LOCAL_PORT
     mode tcp
-    default_backend port_backend
+    default_backend port_backend_$LOCAL_PORT
 
-backend port_backend
+backend port_backend_$LOCAL_PORT
     mode tcp
     balance first
     option tcp-check
     tcp-check connect port $TARGET_PORT
-    
-    server target_server $TARGET_IP:$TARGET_PORT check inter 30s rise 1 fall 1 weight 100 maxconn 32768
+    server target_server_$LOCAL_PORT $HAPROXY_TARGET check inter 30s rise 1 fall 1 weight 100 maxconn 32768
 EOF
+            echo -e "  ✓ :$LOCAL_PORT -> $TARGET_IP:$TARGET_PORT (IPv4+IPv6)"
+        done
 
         # 根据用户选择添加统计页面
         if [[ $ENABLE_WEB =~ ^[Yy]$ ]]; then
@@ -1963,8 +2829,8 @@ EOF
             echo -e "${YELLOW}测试配置: haproxy -c -f /etc/haproxy/haproxy.cfg${NC}"
         fi
         
-        # 获取本机IP
-        LOCAL_IP=$(hostname -I | awk '{print $1}')
+        # 获取本机IP (智能选择 IPv4 或 IPv6)
+        LOCAL_IP=$(get_local_ip)
         
         echo -e "${GREEN}HAProxy配置完成${NC}"
         
@@ -1992,7 +2858,7 @@ EOF
         ;;
         
     4)
-        # socat轻量版
+        # socat轻量版 - 支持多端口
         echo -e "${YELLOW}配置socat轻量转发...${NC}"
         
         # 检查并安装socat
@@ -2004,16 +2870,29 @@ EOF
             fi
         fi
         
-        # 创建systemd服务
-        cat > /etc/systemd/system/port-forward.service << EOF
+        # 为每个端口创建单独的 systemd 服务
+        for mapping in "${PORT_MAPPINGS[@]}"; do
+            LOCAL_PORT=$(echo "$mapping" | cut -d: -f1)
+            TARGET_PORT=$(echo "$mapping" | cut -d: -f2)
+            
+            # IPv6 地址需要用方括号包裹
+            if [ "$IS_IPV6" = true ]; then
+                SOCAT_TARGET="TCP6:[$TARGET_IP]:$TARGET_PORT"
+            else
+                SOCAT_TARGET="TCP:$TARGET_IP:$TARGET_PORT"
+            fi
+            
+            SERVICE_NAME="port-forward-${LOCAL_PORT}"
+            
+            cat > /etc/systemd/system/${SERVICE_NAME}.service << EOF
 [Unit]
-Description=Port Forward Service
+Description=Port Forward Service (Port $LOCAL_PORT)
 After=network.target
 
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/bin/socat TCP-LISTEN:$LOCAL_PORT,fork,reuseaddr,nodelay,keepalive TCP:$TARGET_IP:$TARGET_PORT
+ExecStart=/usr/bin/socat TCP6-LISTEN:$LOCAL_PORT,fork,reuseaddr,nodelay,keepalive,ipv6only=0 $SOCAT_TARGET
 Restart=always
 RestartSec=3
 StandardOutput=null
@@ -2022,16 +2901,17 @@ StandardError=null
 [Install]
 WantedBy=multi-user.target
 EOF
+            
+            systemctl daemon-reload
+            systemctl enable ${SERVICE_NAME}
+            if systemctl start ${SERVICE_NAME} 2>&1; then
+                echo -e "  ${GREEN}✓${NC} :$LOCAL_PORT -> $TARGET_IP:$TARGET_PORT"
+            else
+                echo -e "  ${RED}✗${NC} :$LOCAL_PORT 启动失败"
+            fi
+        done
         
-        systemctl daemon-reload
-        systemctl enable port-forward
-        if systemctl start port-forward 2>&1; then
-            echo -e "${GREEN}socat轻量配置完成${NC}"
-        else
-            echo -e "${RED}socat启动失败${NC}"
-            echo -e "${YELLOW}查看错误日志: journalctl -u port-forward -n 20${NC}"
-            echo -e "${YELLOW}检查socat安装: which socat${NC}"
-        fi
+        echo -e "${GREEN}socat 配置完成，共 ${#PORT_MAPPINGS[@]} 条规则${NC}"
         ;;
         
     5)
@@ -2051,34 +2931,26 @@ EOF
         
         # 检查并安装gost (确保安装在正确位置)
         if [ ! -f /usr/local/bin/gost ] || [ ! -x /usr/local/bin/gost ]; then
+            # 安装前检测网络环境，纯 IPv6 可能需要 DNS64
+            setup_dns64
+            
             echo "安装gost最新版本..."
             
             # 创建临时目录并切换
             GOST_TEMP_DIR=$(mktemp -d)
             cd "$GOST_TEMP_DIR"
             
-            # 使用官方安装脚本
+            # 使用官方安装脚本 (通过智能下载函数)
             INSTALL_SUCCESS=false
             
-            # 方法1: 使用curl安装
-            if command -v curl >/dev/null 2>&1; then
-                echo "使用官方安装脚本 (curl)..."
-                if bash <(curl -fsSL https://github.com/go-gost/gost/raw/master/install.sh) --install 2>/dev/null; then
-                    INSTALL_SUCCESS=true
-                    echo -e "${GREEN}✅ gost安装成功${NC}"
-                fi
+            # 方法1: 使用智能远程执行
+            echo "使用官方安装脚本..."
+            if smart_bash_remote "https://github.com/go-gost/gost/raw/master/install.sh" --install 2>/dev/null; then
+                INSTALL_SUCCESS=true
+                echo -e "${GREEN}✅ gost安装成功${NC}"
             fi
             
-            # 方法2: 如果curl失败，尝试wget
-            if [ "$INSTALL_SUCCESS" = false ] && command -v wget >/dev/null 2>&1; then
-                echo "使用官方安装脚本 (wget)..."
-                if bash <(wget -qO- https://github.com/go-gost/gost/raw/master/install.sh) --install 2>/dev/null; then
-                    INSTALL_SUCCESS=true
-                    echo -e "${GREEN}✅ gost安装成功${NC}"
-                fi
-            fi
-            
-            # 方法3: 如果官方脚本失败，尝试包管理器
+            # 方法2: 如果官方脚本失败，尝试包管理器
             if [ "$INSTALL_SUCCESS" = false ]; then
                 echo "官方脚本安装失败，尝试包管理器..."
                 if [ -f /etc/debian_version ]; then
@@ -2102,9 +2974,12 @@ EOF
             if [ "$INSTALL_SUCCESS" = false ]; then
                 echo -e "${RED}❌ gost自动安装失败${NC}"
                 echo "手动安装方法："
-                echo "1. 运行: bash <(curl -fsSL https://github.com/go-gost/gost/raw/master/install.sh) --install"
+                echo "1. 运行: bash <(curl -fsSL https://ghproxy.com/https://github.com/go-gost/gost/raw/master/install.sh) --install"
                 echo "2. 或访问: https://github.com/go-gost/gost/releases"
                 echo "3. 下载适合您系统的版本并解压到 /usr/local/bin/gost"
+                echo ""
+                echo "国内镜像下载:"
+                echo "  https://ghproxy.com/https://github.com/go-gost/gost/releases/download/v3.x.x/gost_3.x.x_linux_amd64.tar.gz"
                 exit 1
             fi
             
@@ -2130,13 +3005,59 @@ EOF
             fi
         fi
         
-        # 创建systemd服务（gost v3.x使用配置文件方式）
-        if [[ $ENABLE_API =~ ^[Yy]$ ]]; then
-            # 启用API - 创建配置文件
-            mkdir -p /etc/gost
-            cat > /etc/gost/config.yaml << EOF
+        # 创建 gost 配置文件 - 支持追加模式
+        mkdir -p /etc/gost
+        GOST_CONFIG="/etc/gost/config.yaml"
+        
+        # 检查是否已有配置
+        if [ -f "$GOST_CONFIG" ] && grep -q "^services:" "$GOST_CONFIG"; then
+            echo -e "${GREEN}检测到现有 gost 配置，将追加新规则${NC}"
+            # 获取现有最大 service index
+            service_index=$(grep -oE "service-[0-9]+" "$GOST_CONFIG" | grep -oE "[0-9]+" | sort -n | tail -1)
+            service_index=$((service_index + 1))
+        else
+            # 写入配置头部
+            cat > "$GOST_CONFIG" << EOF
 services:
-- name: service-0
+EOF
+            service_index=0
+        fi
+        
+        # 为每个端口添加 service
+        for mapping in "${PORT_MAPPINGS[@]}"; do
+            LOCAL_PORT=$(echo "$mapping" | cut -d: -f1)
+            TARGET_PORT=$(echo "$mapping" | cut -d: -f2)
+            
+            # 先删除该端口的旧配置
+            if grep -q "addr: :$LOCAL_PORT$" "$GOST_CONFIG"; then
+                # 使用 sed 删除该 service 块
+                sed -i "/- name: .*\n.*addr: :$LOCAL_PORT$/,/^- name:/{ /^- name: .*addr: :$LOCAL_PORT/,/^- name:/d }" "$GOST_CONFIG" 2>/dev/null || true
+            fi
+            
+            # IPv6 地址需要用方括号包裹
+            if [ "$IS_IPV6" = true ]; then
+                GOST_TARGET="[$TARGET_IP]:$TARGET_PORT"
+            else
+                GOST_TARGET="$TARGET_IP:$TARGET_PORT"
+            fi
+            
+            # 在 api: 之前插入，或者追加到文件末尾
+            if grep -q "^api:" "$GOST_CONFIG"; then
+                sed -i "/^api:/i\\
+- name: service-${service_index}\\
+  addr: :$LOCAL_PORT\\
+  handler:\\
+    type: tcp\\
+  listener:\\
+    type: tcp\\
+  forwarder:\\
+    nodes:\\
+    - name: target-${service_index}\\
+      addr: $GOST_TARGET\\
+" "$GOST_CONFIG"
+            else
+                cat >> "$GOST_CONFIG" << EOF
+- name: service-${service_index}
   addr: :$LOCAL_PORT
   handler:
     type: tcp
@@ -2144,8 +3065,17 @@ services:
     type: tcp
   forwarder:
     nodes:
-    - name: target-0
-      addr: $TARGET_IP:$TARGET_PORT
+    - name: target-${service_index}
+      addr: $GOST_TARGET
+EOF
+            fi
+            echo -e "  ✓ :$LOCAL_PORT -> $GOST_TARGET"
+            service_index=$((service_index + 1))
+        done
+        
+        # 如果启用 API，添加 API 配置
+        if [[ $ENABLE_API =~ ^[Yy]$ ]]; then
+            cat >> /etc/gost/config.yaml << EOF
 
 api:
   addr: :9999
@@ -2155,8 +3085,10 @@ api:
     username: $GOST_API_USER
     password: $GOST_API_PASSWORD
 EOF
-            
-            cat > /etc/systemd/system/gost-forward.service << EOF
+        fi
+        
+        # 创建 systemd 服务
+        cat > /etc/systemd/system/gost-forward.service << EOF
 [Unit]
 Description=Gost Port Forward
 After=network.target
@@ -2180,43 +3112,10 @@ TasksMax=1024
 [Install]
 WantedBy=multi-user.target
 EOF
-        else
-            # 不启用API - 使用简单命令行
-            cat > /etc/systemd/system/gost-forward.service << EOF
-[Unit]
-Description=Gost Port Forward
-After=network.target
-StartLimitIntervalSec=0
-
-[Service]
-Type=simple
-User=root
-ExecStart=/usr/local/bin/gost -L tcp://:$LOCAL_PORT/$TARGET_IP:$TARGET_PORT
-Restart=always
-RestartSec=5
-StartLimitBurst=3
-StandardOutput=journal
-StandardError=journal
-KillMode=mixed
-KillSignal=SIGTERM
-TimeoutStopSec=30
-MemoryMax=512M
-TasksMax=1024
-
-[Install]
-WantedBy=multi-user.target
-EOF
-        fi
         
         # 先测试gost命令是否能正常启动
         echo -e "${YELLOW}测试gost命令...${NC}"
-        if [[ $ENABLE_API =~ ^[Yy]$ ]]; then
-            # 测试配置文件方式
-            timeout 3 /usr/local/bin/gost -C /etc/gost/config.yaml &
-        else
-            # 测试命令行方式
-            timeout 3 /usr/local/bin/gost -L tcp://:$LOCAL_PORT/$TARGET_IP:$TARGET_PORT &
-        fi
+        timeout 3 /usr/local/bin/gost -C /etc/gost/config.yaml &
         GOST_PID=$!
         sleep 2
         
@@ -2235,15 +3134,15 @@ EOF
         systemctl daemon-reload
         systemctl enable gost-forward
         if systemctl start gost-forward 2>&1; then
-            echo -e "${GREEN}gost服务启动成功${NC}"
+            echo -e "${GREEN}gost 配置完成，共 ${#PORT_MAPPINGS[@]} 条规则${NC}"
         else
             echo -e "${RED}gost启动失败${NC}"
             echo -e "${YELLOW}查看错误日志: journalctl -u gost-forward -n 20${NC}"
             echo -e "${YELLOW}手动测试: /usr/local/bin/gost -V${NC}"
         fi
         
-        # 获取本机IP
-        LOCAL_IP=$(hostname -I | awk '{print $1}')
+        # 获取本机IP (智能选择 IPv4 或 IPv6)
+        LOCAL_IP=$(get_local_ip)
         
         echo -e "${GREEN}gost代理配置完成${NC}"
         
@@ -2279,6 +3178,9 @@ EOF
         
         # 检查并安装realm
         if ! command -v realm >/dev/null 2>&1; then
+            # 安装前检测网络环境，纯 IPv6 可能需要 DNS64
+            setup_dns64
+            
             echo -e "${YELLOW}安装realm...${NC}"
             
             # 确定系统架构
@@ -2289,16 +3191,13 @@ EOF
                 *) REALM_ARCH="x86_64" ;;
             esac
             
-            # 尝试获取最新版本号
+            # 尝试获取最新版本号 (使用智能 API 获取)
             echo -e "${YELLOW}正在获取realm最新版本...${NC}"
             REALM_VERSION=""
             
-            if command -v curl >/dev/null 2>&1; then
-                REALM_VERSION=$(curl -s --connect-timeout 10 https://api.github.com/repos/zhboner/realm/releases/latest | grep '"tag_name"' | cut -d '"' -f 4 2>/dev/null)
-            fi
-            
-            if [ -z "$REALM_VERSION" ] && command -v wget >/dev/null 2>&1; then
-                REALM_VERSION=$(wget -qO- --timeout=10 https://api.github.com/repos/zhboner/realm/releases/latest | grep '"tag_name"' | cut -d '"' -f 4 2>/dev/null)
+            API_RESPONSE=$(smart_api_get "https://api.github.com/repos/zhboner/realm/releases/latest" 15)
+            if [ -n "$API_RESPONSE" ]; then
+                REALM_VERSION=$(echo "$API_RESPONSE" | grep '"tag_name"' | cut -d '"' -f 4 2>/dev/null)
             fi
             
             # 如果无法获取版本号，退出
@@ -2309,26 +3208,15 @@ EOF
             fi
             echo "找到最新版本: $REALM_VERSION"
             
-            # 尝试下载realm
+            # 尝试下载realm (使用智能下载函数)
             DOWNLOAD_SUCCESS=false
             DOWNLOAD_URL="https://github.com/zhboner/realm/releases/download/${REALM_VERSION}/realm-${REALM_ARCH}-unknown-linux-gnu.tar.gz"
             
             echo "正在下载realm..."
             
-            # 尝试使用wget下载
-            if command -v wget >/dev/null 2>&1; then
-                if wget --timeout=30 -q -O /tmp/realm.tar.gz "$DOWNLOAD_URL"; then
-                    DOWNLOAD_SUCCESS=true
-                    echo "wget下载成功"
-                fi
-            fi
-            
-            # 如果wget失败，尝试curl
-            if [ "$DOWNLOAD_SUCCESS" = false ] && command -v curl >/dev/null 2>&1; then
-                if curl -L --connect-timeout 30 -s -o /tmp/realm.tar.gz "$DOWNLOAD_URL"; then
-                    DOWNLOAD_SUCCESS=true
-                    echo "curl下载成功"
-                fi
+            if smart_download "$DOWNLOAD_URL" "/tmp/realm.tar.gz" 60; then
+                DOWNLOAD_SUCCESS=true
+                echo -e "${GREEN}下载成功${NC}"
             fi
             
             # 验证下载的文件
@@ -2359,8 +3247,8 @@ EOF
                 echo -e "${RED}realm下载失败，请手动安装${NC}"
                 echo -e "${YELLOW}手动安装方法：${NC}"
                 echo -e "1. 访问 https://github.com/zhboner/realm/releases"
-                echo -e "2. 下载适合您系统的版本"
-                echo -e "3. 解压并复制到 /usr/local/bin/realm"
+                echo -e "2. 或使用国内镜像: https://ghproxy.com/https://github.com/zhboner/realm/releases/download/${REALM_VERSION}/realm-${REALM_ARCH}-unknown-linux-gnu.tar.gz"
+                echo -e "3. 下载后解压并复制到 /usr/local/bin/realm"
                 exit 1
             fi
             
@@ -2379,17 +3267,49 @@ EOF
             echo -e "${GREEN}realm已安装${NC}"
         fi
         
-        # 创建realm配置文件
+        # 创建realm配置文件 - 支持追加模式
         mkdir -p /etc/realm
-        cat > /etc/realm/config.toml << EOF
+        REALM_CONFIG="/etc/realm/config.toml"
+        
+        # 检查是否已有配置
+        if [ -f "$REALM_CONFIG" ] && grep -q "^\[\[endpoints\]\]" "$REALM_CONFIG"; then
+            echo -e "${GREEN}检测到现有 realm 配置，将追加新规则${NC}"
+        else
+            # 写入配置头部
+            cat > "$REALM_CONFIG" << EOF
 [network]
 use_udp = false
 zero_copy = true
 
-[[endpoints]]
-listen = "0.0.0.0:$LOCAL_PORT"
-remote = "$TARGET_IP:$TARGET_PORT"
 EOF
+        fi
+        
+        # 为每个端口添加 endpoint
+        for mapping in "${PORT_MAPPINGS[@]}"; do
+            LOCAL_PORT=$(echo "$mapping" | cut -d: -f1)
+            TARGET_PORT=$(echo "$mapping" | cut -d: -f2)
+            
+            # 先删除该端口的旧配置 (兼容旧的 0.0.0.0 和新的 [::] 格式)
+            if grep -qE "listen = \"(0\.0\.0\.0|\[::\]):$LOCAL_PORT\"" "$REALM_CONFIG"; then
+                # 删除该 endpoint 块
+                sed -i "/^\[\[endpoints\]\]/{N;/listen = \".*:$LOCAL_PORT\"/,/^$/d}" "$REALM_CONFIG" 2>/dev/null || true
+            fi
+            
+            if [ "$IS_IPV6" = true ]; then
+                REALM_TARGET="[$TARGET_IP]:$TARGET_PORT"
+            else
+                REALM_TARGET="$TARGET_IP:$TARGET_PORT"
+            fi
+            
+            # 使用 [::] 监听，同时支持 IPv4 和 IPv6 入站
+            cat >> "$REALM_CONFIG" << EOF
+[[endpoints]]
+listen = "[::]:$LOCAL_PORT"
+remote = "$REALM_TARGET"
+
+EOF
+            echo -e "  ✓ :$LOCAL_PORT -> $REALM_TARGET (IPv4+IPv6)"
+        done
         
         # 创建systemd服务
         cat > /etc/systemd/system/realm-forward.service << EOF
@@ -2413,7 +3333,7 @@ EOF
         systemctl daemon-reload
         systemctl enable realm-forward
         if systemctl start realm-forward 2>&1; then
-            echo -e "${GREEN}realm转发配置完成${NC}"
+            echo -e "${GREEN}realm 配置完成，共 ${#PORT_MAPPINGS[@]} 条规则${NC}"
         else
             echo -e "${RED}realm启动失败${NC}"
             echo -e "${YELLOW}查看错误日志: journalctl -u realm-forward -n 20${NC}"
@@ -2435,19 +3355,34 @@ EOF
             fi
         fi
         
-        # 停止现有服务
-        systemctl stop rinetd 2>/dev/null || true
-        killall rinetd 2>/dev/null || true
+        # rinetd 配置 - 支持追加模式
+        RINETD_CONFIG="/etc/rinetd.conf"
         
-        # 创建rinetd配置文件
-        cat > /etc/rinetd.conf << EOF
+        # 检查是否已有配置
+        if [ -f "$RINETD_CONFIG" ] && grep -q "^0.0.0.0" "$RINETD_CONFIG"; then
+            echo -e "${GREEN}检测到现有 rinetd 配置，将追加新规则${NC}"
+        else
+            # 创建新配置文件
+            cat > "$RINETD_CONFIG" << EOF
 # rinetd配置文件 - 由端口转发脚本生成
 # 格式: bindaddress bindport connectaddress connectport
-0.0.0.0 $LOCAL_PORT $TARGET_IP $TARGET_PORT
 
 # 日志文件
 logfile /var/log/rinetd.log
 EOF
+        fi
+        
+        for mapping in "${PORT_MAPPINGS[@]}"; do
+            LOCAL_PORT=$(echo "$mapping" | cut -d: -f1)
+            TARGET_PORT=$(echo "$mapping" | cut -d: -f2)
+            
+            # 先删除该端口的旧配置
+            sed -i "/^0.0.0.0 $LOCAL_PORT /d" "$RINETD_CONFIG" 2>/dev/null || true
+            
+            # 在 logfile 行之前插入新规则
+            sed -i "/^logfile/i 0.0.0.0 $LOCAL_PORT $TARGET_IP $TARGET_PORT" "$RINETD_CONFIG"
+            echo -e "  ✓ :$LOCAL_PORT -> $TARGET_IP:$TARGET_PORT"
+        done
         
         # 检测rinetd路径
         RINETD_BIN="/usr/sbin/rinetd"
@@ -2475,7 +3410,7 @@ EOF
         sleep 2
         
         if systemctl is-active rinetd >/dev/null 2>&1; then
-            echo -e "${GREEN}rinetd配置完成${NC}"
+            echo -e "${GREEN}rinetd 配置完成，共 $(grep -c "^0.0.0.0" "$RINETD_CONFIG") 条规则${NC}"
         else
             echo -e "${RED}rinetd启动失败，查看日志...${NC}"
             journalctl -u rinetd -n 10 --no-pager
@@ -2578,15 +3513,27 @@ stream {
 EOF
         fi
         
-        # 创建stream转发配置
-        cat > /etc/nginx/stream.d/port-forward-${LOCAL_PORT}.conf << EOF
+        # 为每个端口创建 stream 转发配置
+        for mapping in "${PORT_MAPPINGS[@]}"; do
+            LOCAL_PORT=$(echo "$mapping" | cut -d: -f1)
+            TARGET_PORT=$(echo "$mapping" | cut -d: -f2)
+            
+            # IPv6 地址需要用方括号包裹
+            if [ "$IS_IPV6" = true ]; then
+                NGINX_TARGET="[$TARGET_IP]:$TARGET_PORT"
+            else
+                NGINX_TARGET="$TARGET_IP:$TARGET_PORT"
+            fi
+            
+            cat > /etc/nginx/stream.d/port-forward-${LOCAL_PORT}.conf << EOF
 # Nginx Stream 端口转发配置 - 端口 $LOCAL_PORT
 upstream backend_$LOCAL_PORT {
-    server $TARGET_IP:$TARGET_PORT max_fails=3 fail_timeout=30s;
+    server $NGINX_TARGET max_fails=3 fail_timeout=30s;
 }
 
 server {
     listen $LOCAL_PORT;
+    listen [::]:$LOCAL_PORT;
     proxy_pass backend_$LOCAL_PORT;
     
     # 性能优化
@@ -2598,6 +3545,8 @@ server {
     tcp_nodelay on;
 }
 EOF
+            echo -e "  ✓ :$LOCAL_PORT -> $TARGET_IP:$TARGET_PORT (IPv4+IPv6)"
+        done
         
         # 测试nginx配置
         echo -e "${YELLOW}测试nginx配置...${NC}"
@@ -2609,7 +3558,7 @@ EOF
             else
                 systemctl restart nginx 2>&1 && echo -e "${GREEN}nginx已启动${NC}"
             fi
-            echo -e "${GREEN}nginx stream配置完成${NC}"
+            echo -e "${GREEN}nginx stream 配置完成，共 ${#PORT_MAPPINGS[@]} 条规则${NC}"
         else
             echo -e "${RED}nginx配置测试失败${NC}"
             echo -e "${YELLOW}详细错误信息:${NC}"
@@ -2793,7 +3742,7 @@ echo ""
 echo "🚀 端口转发服务已启动！"
 echo ""
 echo "连接信息："
-echo "本地地址: $(hostname -I | awk '{print $1}'):$LOCAL_PORT"
+echo "本地地址: $(get_local_ip):$LOCAL_PORT"
 echo "目标地址: $TARGET_IP:$TARGET_PORT"
 case $FORWARD_METHOD in
     1) echo "转发方式: iptables DNAT" ;;
@@ -2826,7 +3775,7 @@ echo "测试方法："
 case $FORWARD_METHOD in
     1) 
         IPTABLES_CMD=$(get_iptables_cmd)
-        LOCAL_IP=$(hostname -I | awk '{print $1}')
+        LOCAL_IP=$(get_local_ip)
         echo "从其他机器测试:"
         echo "  telnet $LOCAL_IP $LOCAL_PORT"
         echo ""
@@ -2834,7 +3783,7 @@ case $FORWARD_METHOD in
         echo "  $IPTABLES_CMD -t nat -L -n -v"
         ;;
     2)
-        LOCAL_IP=$(hostname -I | awk '{print $1}')
+        LOCAL_IP=$(get_local_ip)
         echo "从其他机器测试:"
         echo "  telnet $LOCAL_IP $LOCAL_PORT"
         echo ""
@@ -2851,7 +3800,7 @@ case $FORWARD_METHOD in
         echo -e "查看配置: cat /etc/haproxy/haproxy.cfg"
         echo -e "Web凭据: cat /root/haproxy_credentials.txt"
         if [ -f /root/haproxy_credentials.txt ]; then
-            echo -e "统计页面: http://$(hostname -I | awk '{print $1}'):8888/haproxy-stats"
+            echo -e "统计页面: http://$(get_local_ip):8888/haproxy-stats"
         fi
         ;;
     4) 
@@ -2872,7 +3821,7 @@ case $FORWARD_METHOD in
         fi
         echo "API凭据: cat /root/gost_credentials.txt"
         if [ -f /root/gost_credentials.txt ]; then
-            echo "Web API: http://$(hostname -I | awk '{print $1}'):9999/api/config"
+            echo "Web API: http://$(get_local_ip):9999/api/config"
         fi
         ;;
     6)
@@ -2905,11 +3854,11 @@ case $FORWARD_METHOD in
         echo -e "查看配置: ls /etc/nginx/stream.d/"
         echo -e "测试配置: nginx -t"
         echo -e "重载配置: nginx -s reload"
-        echo -e "状态页面: http://$(hostname -I | awk '{print $1}'):$NGINX_STATUS_PORT/nginx-status"
+        echo -e "状态页面: http://$(get_local_ip):$NGINX_STATUS_PORT/nginx-status"
         ;;
 esac
 
-echo -e "测试连接: telnet $(hostname -I | awk '{print $1}') $LOCAL_PORT"
+echo -e "测试连接: telnet $(get_local_ip) $LOCAL_PORT"
 echo -e "配置备份: $BACKUP_DIR"
 
 echo ""
