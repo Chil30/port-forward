@@ -9,7 +9,7 @@
 # ============================================================================
 
 # 版本信息
-VERSION="1.0.2"
+VERSION="1.0.3"
 AUTHOR="Chli30"
 GITHUB_URL="https://github.com/Chil30/port-forward"
 
@@ -561,14 +561,89 @@ show_header() {
     fi
     
     echo ""
-    echo -e "${CYAN}═══════════════════════════════════════════════════════════════════════════${NC}"
-    echo -e "                    ${CYAN}端口转发管理工具${NC}  ${BOLD}v${VERSION}${NC}"
-    echo -e "${CYAN}───────────────────────────────────────────────────────────────────────────${NC}"
-    echo -e "  状态: ${status_text}    转发规则: ${CYAN}${forward_count}${NC} 条    网络: ${net_info}"
+    echo -e "${CYAN}════════════════════════════════════════════════${NC}"
+    echo -e "      ${CYAN}端口转发管理工具${NC}  ${BOLD}v${VERSION}${NC}"
+    echo -e "${CYAN}────────────────────────────────────────────────${NC}"
+    echo -e "  状态: ${status_text}    规则: ${CYAN}${forward_count}${NC} 条    网络: ${net_info}"
     echo -e "  作者: ${CYAN}${AUTHOR}${NC}    命令: ${CYAN}pf${NC}"
     echo -e "  项目: ${CYAN}${GITHUB_URL}${NC}"
-    echo -e "${CYAN}═══════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${CYAN}════════════════════════════════════════════════${NC}"
     echo ""
+}
+
+# 设置开机自启（自动调用，无需用户操作）
+setup_autostart() {
+    local method="$1"  # nftables, iptables, haproxy, gost, realm, etc.
+    
+    # 对于 nftables/iptables，创建恢复服务
+    if [[ "$method" == "nftables" || "$method" == "iptables" ]]; then
+        # 检查是否已存在
+        if systemctl is-enabled port-forward-restore >/dev/null 2>&1; then
+            return 0
+        fi
+        
+        # 创建恢复脚本
+        mkdir -p /var/lib/port-forward
+        cat > /var/lib/port-forward/restore.sh << 'RESTORE_SCRIPT'
+#!/bin/bash
+# 端口转发规则恢复脚本
+
+# 启用 IP 转发
+echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null
+echo 1 > /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null
+
+# 恢复 nftables 规则
+if [ -f /etc/nftables.d/port_forward.nft ]; then
+    nft -f /etc/nftables.d/port_forward.nft 2>/dev/null
+fi
+
+# 恢复 iptables 规则
+if [ -f /root/.port_forward_iptables_running.txt ]; then
+    if command -v iptables-legacy-restore >/dev/null 2>&1; then
+        iptables-legacy-restore < /root/.port_forward_iptables_running.txt 2>/dev/null
+    else
+        iptables-restore < /root/.port_forward_iptables_running.txt 2>/dev/null
+    fi
+fi
+
+# 恢复 nftables 运行时备份
+if [ -f /root/.port_forward_nftables_running.txt ]; then
+    nft -f /root/.port_forward_nftables_running.txt 2>/dev/null
+fi
+RESTORE_SCRIPT
+        chmod +x /var/lib/port-forward/restore.sh
+        
+        # 创建 systemd 服务
+        cat > /etc/systemd/system/port-forward-restore.service << 'SERVICE_FILE'
+[Unit]
+Description=Port Forward Rules Restore
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/var/lib/port-forward/restore.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+SERVICE_FILE
+        
+        systemctl daemon-reload
+        systemctl enable port-forward-restore >/dev/null 2>&1
+    fi
+    
+    # 对于用户态服务，直接启用开机自启
+    case "$method" in
+        haproxy|gost|realm|rinetd|nginx)
+            systemctl enable "${method}" >/dev/null 2>&1 || true
+            ;;
+        gost-forward)
+            systemctl enable gost-forward >/dev/null 2>&1 || true
+            ;;
+        realm-forward)
+            systemctl enable realm-forward >/dev/null 2>&1 || true
+            ;;
+    esac
 }
 
 # 检查权限
@@ -581,29 +656,69 @@ fi
 # 初始化流量统计
 init_traffic_stats
 
-# 快捷命令安装函数 (参考 vless-server.sh)
+# 同步检查系统脚本 (MD5校验)
+sync_system_script() {
+    local system_script="/usr/local/bin/port_forward.sh"
+    local current_script="$0"
+    
+    # 获取当前脚本的绝对路径（解析软链接）
+    local real_path
+    if [[ "$current_script" == /* ]]; then
+        real_path=$(readlink -f "$current_script" 2>/dev/null || echo "$current_script")
+    elif [[ "$current_script" == "bash" || "$current_script" == "-bash" ]]; then
+        real_path=""
+    else
+        real_path="$(cd "$(dirname "$current_script")" 2>/dev/null && pwd)/$(basename "$current_script")"
+        real_path=$(readlink -f "$real_path" 2>/dev/null || echo "$real_path")
+    fi
+    
+    # 如果当前脚本不是系统脚本，检查是否需要更新
+    if [[ -n "$real_path" && -f "$real_path" && "$real_path" != "$system_script" ]]; then
+        local need_update=false
+        
+        if [[ ! -f "$system_script" ]]; then
+            need_update=true
+        else
+            # 用 md5 校验文件内容是否不同
+            local cur_md5 sys_md5
+            cur_md5=$(md5sum "$real_path" 2>/dev/null | cut -d' ' -f1)
+            sys_md5=$(md5sum "$system_script" 2>/dev/null | cut -d' ' -f1)
+            [[ "$cur_md5" != "$sys_md5" ]] && need_update=true
+        fi
+        
+        if [[ "$need_update" == "true" ]]; then
+            cp -f "$real_path" "$system_script" 2>/dev/null
+            chmod +x "$system_script" 2>/dev/null
+            ln -sf "$system_script" /usr/local/bin/pf 2>/dev/null
+            ln -sf "$system_script" /usr/bin/pf 2>/dev/null
+            hash -r 2>/dev/null
+            echo -e "${GREEN}✓ 系统脚本已同步更新 (v$VERSION)${NC}"
+        fi
+    fi
+}
+
+# 快捷命令安装函数
 create_shortcut() {
     local system_script="/usr/local/bin/port_forward.sh"
     local current_script="$0"
 
-    # 获取当前脚本的绝对路径
+    # 获取当前脚本的绝对路径（解析软链接）
     local real_path
     if [[ "$current_script" == /* ]]; then
-        real_path="$current_script"
+        real_path=$(readlink -f "$current_script" 2>/dev/null || echo "$current_script")
     elif [[ "$current_script" == "bash" || "$current_script" == "-bash" ]]; then
-        # 内存运行模式 (curl | bash)
         real_path=""
     else
         real_path="$(cd "$(dirname "$current_script")" 2>/dev/null && pwd)/$(basename "$current_script")"
+        real_path=$(readlink -f "$real_path" 2>/dev/null || echo "$real_path")
     fi
 
     # 如果系统目录没有脚本，需要创建
     if [[ ! -f "$system_script" ]]; then
         if [[ -n "$real_path" && -f "$real_path" ]]; then
-            # 从当前脚本复制（不删除原文件）
             cp -f "$real_path" "$system_script"
         else
-            # 内存运行模式，从网络下载 (使用智能下载函数)
+            # 内存运行模式，从网络下载
             local raw_url="https://raw.githubusercontent.com/Chil30/port-forward/main/port_forward.sh"
             echo -e "${CYAN}正在下载脚本...${NC}"
             if ! smart_download "$raw_url" "$system_script" 15; then
@@ -612,8 +727,11 @@ create_shortcut() {
             fi
         fi
     elif [[ -n "$real_path" && -f "$real_path" && "$real_path" != "$system_script" ]]; then
-        # 系统目录已有脚本，用当前脚本更新（不删除原文件）
-        cp -f "$real_path" "$system_script"
+        # 用 md5 校验，不同才更新
+        local cur_md5 sys_md5
+        cur_md5=$(md5sum "$real_path" 2>/dev/null | cut -d' ' -f1)
+        sys_md5=$(md5sum "$system_script" 2>/dev/null | cut -d' ' -f1)
+        [[ "$cur_md5" != "$sys_md5" ]] && cp -f "$real_path" "$system_script"
     fi
 
     chmod +x "$system_script" 2>/dev/null
@@ -632,11 +750,14 @@ remove_shortcut() {
     echo -e "${GREEN}✓ 快捷命令已移除${NC}"
 }
 
+# 每次运行时同步检查并更新系统脚本
+sync_system_script
+
 # 首次运行时自动安装快捷命令
 SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 SYSTEM_SCRIPT="/usr/local/bin/port_forward.sh"
 
-if [[ "$SCRIPT_PATH" != "$SYSTEM_SCRIPT" ]] && [[ ! -f "/usr/local/bin/pf" ]]; then
+if [[ ! -f "/usr/local/bin/pf" ]]; then
     echo "首次运行，正在安装快捷命令..."
     create_shortcut
     sleep 1
@@ -654,9 +775,9 @@ if check_forward_running; then
 else
     echo "  4) 启动转发服务"
 fi
-echo "  5) 查看备份文件"
-echo "  6) 流量统计"
-echo "  7) 卸载转发服务"
+echo "  5) 流量统计"
+echo "  6) 卸载转发服务"
+echo "  7) 导入/导出配置"
 echo "  0) 退出"
 echo ""
 
@@ -1328,62 +1449,85 @@ case $MAIN_ACTION in
             # 检查可用的服务配置
             HAS_OPTIONS=false
             
-            # 1. nftables
+            # 1. nftables - 检查配置文件或备份
             NFT_RUNNING_BACKUP="/root/.port_forward_nftables_running.txt"
+            NFT_CONFIG="/etc/nftables.d/port_forward.nft"
             if [ -f "$NFT_RUNNING_BACKUP" ] && [ -s "$NFT_RUNNING_BACKUP" ]; then
-                echo "1) nftables DNAT (从备份恢复)"
+                echo "1) nftables DNAT (从运行时备份恢复)"
+                HAS_OPTIONS=true
+            elif [ -f "$NFT_CONFIG" ] && [ -s "$NFT_CONFIG" ]; then
+                echo "1) nftables DNAT (从配置文件恢复)"
                 HAS_OPTIONS=true
             fi
             
-            # 也检查 /etc/nftables.d 中的配置
-            if [ -f /etc/nftables.d/port_forward.nft ]; then
-                if [ ! -f "$NFT_RUNNING_BACKUP" ]; then
-                    echo "1) nftables DNAT (从配置恢复)"
-                    HAS_OPTIONS=true
-                fi
-            fi
-            
-            # 2. iptables
+            # 2. iptables - 检查备份文件或 netfilter-persistent
             IPTABLES_RUNNING_BACKUP="/root/.port_forward_iptables_running.txt"
             if [ -f "$IPTABLES_RUNNING_BACKUP" ] && [ -s "$IPTABLES_RUNNING_BACKUP" ]; then
                 echo "2) iptables DNAT (从备份恢复)"
                 HAS_OPTIONS=true
-            fi
-            
-            # 3. HAProxy
-            if [ -f /etc/haproxy/haproxy.cfg ] && systemctl is-enabled haproxy >/dev/null 2>&1; then
-                echo "3) HAProxy"
+            elif [ -f /etc/iptables/rules.v4 ] && grep -q DNAT /etc/iptables/rules.v4 2>/dev/null; then
+                echo "2) iptables DNAT (从 netfilter-persistent 恢复)"
                 HAS_OPTIONS=true
             fi
             
-            # 4. socat
-            if systemctl is-enabled port-forward >/dev/null 2>&1; then
-                echo "4) socat"
-                HAS_OPTIONS=true
+            # 3. HAProxy - 检查配置文件存在即可
+            if [ -f /etc/haproxy/haproxy.cfg ]; then
+                if systemctl is-active haproxy >/dev/null 2>&1; then
+                    echo "3) HAProxy (已运行)"
+                else
+                    echo "3) HAProxy"
+                    HAS_OPTIONS=true
+                fi
             fi
             
-            # 5. gost
-            if [ -f /etc/gost/config.json ] && systemctl is-enabled gost-forward >/dev/null 2>&1; then
-                echo "5) gost"
-                HAS_OPTIONS=true
+            # 4. socat - 检查服务文件
+            if [ -f /etc/systemd/system/port-forward.service ] || [ -f /etc/systemd/system/port-forward@.service ]; then
+                if systemctl is-active port-forward >/dev/null 2>&1; then
+                    echo "4) socat (已运行)"
+                else
+                    echo "4) socat"
+                    HAS_OPTIONS=true
+                fi
             fi
             
-            # 6. realm
-            if [ -f /etc/realm/config.toml ] && systemctl is-enabled realm-forward >/dev/null 2>&1; then
-                echo "6) realm"
-                HAS_OPTIONS=true
+            # 5. gost - 检查配置文件
+            if [ -f /etc/gost/config.json ] || [ -f /etc/gost/config.yaml ]; then
+                if systemctl is-active gost-forward >/dev/null 2>&1; then
+                    echo "5) gost (已运行)"
+                else
+                    echo "5) gost"
+                    HAS_OPTIONS=true
+                fi
             fi
             
-            # 7. rinetd
-            if [ -f /etc/rinetd.conf ] && systemctl is-enabled rinetd >/dev/null 2>&1; then
-                echo "7) rinetd"
-                HAS_OPTIONS=true
+            # 6. realm - 检查配置文件
+            if [ -f /etc/realm/config.toml ]; then
+                if systemctl is-active realm-forward >/dev/null 2>&1; then
+                    echo "6) realm (已运行)"
+                else
+                    echo "6) realm"
+                    HAS_OPTIONS=true
+                fi
             fi
             
-            # 8. nginx stream
+            # 7. rinetd - 检查配置文件
+            if [ -f /etc/rinetd.conf ] && grep -qE '^[0-9]' /etc/rinetd.conf 2>/dev/null; then
+                if systemctl is-active rinetd >/dev/null 2>&1; then
+                    echo "7) rinetd (已运行)"
+                else
+                    echo "7) rinetd"
+                    HAS_OPTIONS=true
+                fi
+            fi
+            
+            # 8. nginx stream - 检查配置文件
             if [ -d /etc/nginx/stream.d ] && ls /etc/nginx/stream.d/port-forward-*.conf >/dev/null 2>&1; then
-                echo "8) nginx stream"
-                HAS_OPTIONS=true
+                if systemctl is-active nginx >/dev/null 2>&1; then
+                    echo "8) nginx stream (已运行)"
+                else
+                    echo "8) nginx stream"
+                    HAS_OPTIONS=true
+                fi
             fi
             
             echo "9) 启动所有可用服务"
@@ -1392,7 +1536,7 @@ case $MAIN_ACTION in
             
             if [ "$HAS_OPTIONS" = false ]; then
                 echo -e "${YELLOW}未找到任何可启动的转发配置${NC}"
-                echo -e "${YELLOW}请先配置端口转发（选项1）${NC}"
+                echo -e "${YELLOW}请先配置端口转发（选项1）或导入配置（选项8）${NC}"
             else
                 read -p "请选择 [9]: " START_CHOICE
                 START_CHOICE=${START_CHOICE:-9}
@@ -1402,48 +1546,96 @@ case $MAIN_ACTION in
                         # 恢复 nftables 规则
                         if command -v nft >/dev/null 2>&1; then
                             echo 1 > /proc/sys/net/ipv4/ip_forward
+                            echo 1 > /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null || true
+                            
                             if [ -f "$NFT_RUNNING_BACKUP" ] && [ -s "$NFT_RUNNING_BACKUP" ]; then
-                                nft -f "$NFT_RUNNING_BACKUP" 2>/dev/null
-                                echo -e "${GREEN}✓ nftables 规则已从备份恢复${NC}"
-                            elif [ -f /etc/nftables.d/port_forward.nft ]; then
-                                nft -f /etc/nftables.d/port_forward.nft 2>/dev/null
-                                echo -e "${GREEN}✓ nftables 规则已从配置恢复${NC}"
+                                if nft -f "$NFT_RUNNING_BACKUP" 2>/dev/null; then
+                                    echo -e "${GREEN}✓ nftables 规则已从运行时备份恢复${NC}"
+                                else
+                                    echo -e "${RED}✗ 从运行时备份恢复失败，尝试配置文件...${NC}"
+                                    [ -f "$NFT_CONFIG" ] && nft -f "$NFT_CONFIG" 2>/dev/null && echo -e "${GREEN}✓ 从配置文件恢复成功${NC}"
+                                fi
+                            elif [ -f "$NFT_CONFIG" ]; then
+                                if nft -f "$NFT_CONFIG" 2>/dev/null; then
+                                    echo -e "${GREEN}✓ nftables 规则已从配置文件恢复${NC}"
+                                else
+                                    echo -e "${RED}✗ 恢复失败，配置文件可能损坏${NC}"
+                                fi
                             fi
-                            nft list table inet port_forward 2>/dev/null | grep -c "dnat" | xargs -I {} echo -e "${GREEN}当前规则数: {}${NC}"
+                            
+                            # 显示当前规则数
+                            rule_count=$(nft list table inet port_forward 2>/dev/null | grep -c "dnat" || echo "0")
+                            echo -e "${GREEN}当前规则数: $rule_count${NC}"
                         else
                             echo -e "${RED}nftables 未安装${NC}"
                         fi
                         ;;
                     2)
                         IPTABLES_CMD=$(get_iptables_cmd)
-                        if [ -f "$IPTABLES_RUNNING_BACKUP" ]; then
-                            echo 1 > /proc/sys/net/ipv4/ip_forward
+                        echo 1 > /proc/sys/net/ipv4/ip_forward
+                        
+                        if [ -f "$IPTABLES_RUNNING_BACKUP" ] && [ -s "$IPTABLES_RUNNING_BACKUP" ]; then
                             if [[ "$IPTABLES_CMD" == "iptables-legacy" ]]; then
                                 iptables-legacy-restore < "$IPTABLES_RUNNING_BACKUP" 2>/dev/null
                             else
                                 iptables-restore < "$IPTABLES_RUNNING_BACKUP" 2>/dev/null
                             fi
-                            DNAT_COUNT=$($IPTABLES_CMD -t nat -L PREROUTING -n 2>/dev/null | grep -c DNAT)
-                            echo -e "${GREEN}✓ iptables 规则已恢复，$DNAT_COUNT 条规则${NC}"
+                            DNAT_COUNT=$($IPTABLES_CMD -t nat -L PREROUTING -n 2>/dev/null | grep -c DNAT || echo "0")
+                            echo -e "${GREEN}✓ iptables 规则已从备份恢复，$DNAT_COUNT 条规则${NC}"
+                        elif [ -f /etc/iptables/rules.v4 ]; then
+                            # 使用 netfilter-persistent 恢复
+                            netfilter-persistent reload 2>/dev/null || iptables-restore < /etc/iptables/rules.v4 2>/dev/null
+                            DNAT_COUNT=$($IPTABLES_CMD -t nat -L PREROUTING -n 2>/dev/null | grep -c DNAT || echo "0")
+                            echo -e "${GREEN}✓ iptables 规则已从 netfilter-persistent 恢复，$DNAT_COUNT 条规则${NC}"
+                        else
+                            echo -e "${RED}未找到 iptables 备份文件${NC}"
                         fi
                         ;;
                     3)
-                        systemctl start haproxy 2>/dev/null && echo -e "${GREEN}✓ HAProxy 已启动${NC}"
+                        if systemctl start haproxy 2>/dev/null; then
+                            echo -e "${GREEN}✓ HAProxy 已启动${NC}"
+                        else
+                            echo -e "${RED}✗ HAProxy 启动失败${NC}"
+                            journalctl -u haproxy -n 5 --no-pager 2>/dev/null
+                        fi
                         ;;
                     4)
-                        systemctl start port-forward 2>/dev/null && echo -e "${GREEN}✓ socat 已启动${NC}"
+                        if systemctl start port-forward 2>/dev/null; then
+                            echo -e "${GREEN}✓ socat 已启动${NC}"
+                        else
+                            echo -e "${RED}✗ socat 启动失败${NC}"
+                        fi
                         ;;
                     5)
-                        systemctl start gost-forward 2>/dev/null && echo -e "${GREEN}✓ gost 已启动${NC}"
+                        if systemctl start gost-forward 2>/dev/null; then
+                            echo -e "${GREEN}✓ gost 已启动${NC}"
+                        else
+                            echo -e "${RED}✗ gost 启动失败${NC}"
+                            journalctl -u gost-forward -n 5 --no-pager 2>/dev/null
+                        fi
                         ;;
                     6)
-                        systemctl start realm-forward 2>/dev/null && echo -e "${GREEN}✓ realm 已启动${NC}"
+                        if systemctl start realm-forward 2>/dev/null; then
+                            echo -e "${GREEN}✓ realm 已启动${NC}"
+                        else
+                            echo -e "${RED}✗ realm 启动失败${NC}"
+                            journalctl -u realm-forward -n 5 --no-pager 2>/dev/null
+                        fi
                         ;;
                     7)
-                        systemctl start rinetd 2>/dev/null && echo -e "${GREEN}✓ rinetd 已启动${NC}"
+                        if systemctl start rinetd 2>/dev/null; then
+                            echo -e "${GREEN}✓ rinetd 已启动${NC}"
+                        else
+                            echo -e "${RED}✗ rinetd 启动失败${NC}"
+                        fi
                         ;;
                     8)
-                        systemctl start nginx 2>/dev/null && echo -e "${GREEN}✓ nginx 已启动${NC}"
+                        if systemctl start nginx 2>/dev/null; then
+                            echo -e "${GREEN}✓ nginx 已启动${NC}"
+                        else
+                            echo -e "${RED}✗ nginx 启动失败${NC}"
+                            nginx -t 2>&1
+                        fi
                         ;;
                     9)
                         echo -e "${YELLOW}启动所有可用服务...${NC}"
@@ -1491,43 +1683,6 @@ case $MAIN_ACTION in
         exec $0
         ;;
     5)
-        # 查看备份文件
-        echo -e "${CYAN}${BOLD}=== 备份文件列表 ===${NC}"
-        echo ""
-        BACKUP_BASE_DIR="/root/.port_forward_backups"
-        if [ ! -d "$BACKUP_BASE_DIR" ]; then
-            echo -e "${YELLOW}备份目录不存在${NC}"
-        else
-            BACKUP_COUNT=$(ls -d "$BACKUP_BASE_DIR"/* 2>/dev/null | wc -l)
-            if [ $BACKUP_COUNT -eq 0 ]; then
-                echo -e "${YELLOW}没有备份文件${NC}"
-            else
-                echo -e "共 ${GREEN}$BACKUP_COUNT${NC} 个备份文件"
-                echo ""
-                
-                i=1
-                ls -dt "$BACKUP_BASE_DIR"/* 2>/dev/null | head -20 | while read backup; do
-                    timestamp=$(basename "$backup")
-                    size=$(du -sh "$backup" 2>/dev/null | awk '{print $1}')
-                    echo -e "${CYAN}[$i]${NC} $timestamp (大小: $size)"
-                    if [ -f "$backup/backup_info.txt" ]; then
-                        cat "$backup/backup_info.txt" | grep -v "备份时间" | sed 's/^/    /'
-                    fi
-                    echo ""
-                    i=$((i+1))
-                done
-                
-                if [ $BACKUP_COUNT -gt 20 ]; then
-                    echo -e "${DIM}... 还有 $((BACKUP_COUNT-20)) 个更早的备份${NC}"
-                fi
-            fi
-        fi
-        echo ""
-        echo "按回车键返回主菜单..."
-        read
-        exec $0
-        ;;
-    6)
         # 流量统计
         echo -e "${CYAN}${BOLD}╔═══════════════════════════════════════════╗${NC}"
         echo -e "${CYAN}${BOLD}║           流量统计                        ║${NC}"
@@ -1727,18 +1882,19 @@ case $MAIN_ACTION in
         read
         exec $0
         ;;
-    7)
+    6)
         echo -e "${CYAN}${BOLD}=== 卸载转发服务 ===${NC}"
         echo ""
         echo -e "${YELLOW}请选择要卸载的服务：${NC}"
-        echo -e "1) iptables/nftables DNAT 规则"
-        echo -e "2) HAProxy"
-        echo -e "3) socat (port-forward)"
-        echo -e "4) gost"
-        echo -e "5) realm"
-        echo -e "6) rinetd"
-        echo -e "7) nginx stream配置"
-        echo -e "8) ${RED}卸载所有服务${NC}"
+        echo -e "1) iptables DNAT 规则"
+        echo -e "2) nftables DNAT 规则"
+        echo -e "3) HAProxy"
+        echo -e "4) socat (port-forward)"
+        echo -e "5) gost"
+        echo -e "6) realm"
+        echo -e "7) rinetd"
+        echo -e "8) nginx stream配置"
+        echo -e "9) ${RED}卸载所有服务${NC}"
         echo -e "0) 返回主菜单"
         echo ""
         read -p "$(echo -e ${YELLOW}请选择 [0]: ${NC})" UNINSTALL_CHOICE
@@ -1754,9 +1910,7 @@ case $MAIN_ACTION in
         if [[ $CONFIRM_UNINSTALL =~ ^[Yy]$ ]]; then
             case $UNINSTALL_CHOICE in
                 1)
-                    echo -e "${YELLOW}清理 iptables/nftables DNAT 规则...${NC}"
-                    
-                    # 清理 iptables 规则
+                    echo -e "${YELLOW}清理 iptables DNAT 规则...${NC}"
                     IPTABLES_CMD=$(get_iptables_cmd)
                     $IPTABLES_CMD -t nat -S 2>/dev/null | grep "\-A.*DNAT" | sed 's/-A/-D/' | while read rule; do
                         $IPTABLES_CMD -t nat $rule 2>/dev/null || true
@@ -1764,28 +1918,33 @@ case $MAIN_ACTION in
                     $IPTABLES_CMD -t nat -S 2>/dev/null | grep "\-A.*MASQUERADE" | sed 's/-A/-D/' | while read rule; do
                         $IPTABLES_CMD -t nat $rule 2>/dev/null || true
                     done
+                    rm -f /root/.port_forward_iptables_running.txt 2>/dev/null
                     echo -e "${GREEN}✓ iptables DNAT 规则已清理${NC}"
-                    
-                    # 清理 nftables 规则
+                    ;;
+                2)
+                    echo -e "${YELLOW}清理 nftables DNAT 规则...${NC}"
                     if command -v nft >/dev/null 2>&1; then
                         nft delete table inet port_forward 2>/dev/null || true
                         rm -f /etc/nftables.d/port_forward.nft 2>/dev/null || true
+                        rm -f /root/.port_forward_nftables_running.txt 2>/dev/null
                         echo -e "${GREEN}✓ nftables DNAT 规则已清理${NC}"
+                    else
+                        echo -e "${YELLOW}nftables 未安装${NC}"
                     fi
                     ;;
-                2)
+                3)
                     systemctl stop haproxy 2>/dev/null || true
                     systemctl disable haproxy 2>/dev/null || true
                     echo -e "${GREEN}✓ HAProxy已停止和禁用${NC}"
                     ;;
-                3)
+                4)
                     systemctl stop port-forward 2>/dev/null || true
                     systemctl disable port-forward 2>/dev/null || true
                     rm -f /etc/systemd/system/port-forward.service
                     systemctl daemon-reload
                     echo -e "${GREEN}✓ socat转发服务已卸载${NC}"
                     ;;
-                4)
+                5)
                     systemctl stop gost-forward 2>/dev/null || true
                     systemctl disable gost-forward 2>/dev/null || true
                     rm -f /etc/systemd/system/gost-forward.service
@@ -1794,7 +1953,7 @@ case $MAIN_ACTION in
                     systemctl daemon-reload
                     echo -e "${GREEN}✓ gost已卸载${NC}"
                     ;;
-                5)
+                6)
                     systemctl stop realm-forward 2>/dev/null || true
                     systemctl disable realm-forward 2>/dev/null || true
                     rm -f /etc/systemd/system/realm-forward.service
@@ -1803,13 +1962,13 @@ case $MAIN_ACTION in
                     systemctl daemon-reload
                     echo -e "${GREEN}✓ realm已卸载${NC}"
                     ;;
-                6)
+                7)
                     systemctl stop rinetd 2>/dev/null || true
                     systemctl disable rinetd 2>/dev/null || true
                     rm -f /etc/rinetd.conf
                     echo -e "${GREEN}✓ rinetd已停止和禁用${NC}"
                     ;;
-                7)
+                8)
                     # 删除stream转发配置文件
                     if [ -d /etc/nginx/stream.d ]; then
                         rm -f /etc/nginx/stream.d/port-forward-*.conf
@@ -1830,7 +1989,7 @@ case $MAIN_ACTION in
                     fi
                     echo -e "${GREEN}✓ nginx stream配置已删除${NC}"
                     ;;
-                8)
+                9)
                     echo -e "${YELLOW}卸载所有转发服务...${NC}"
                     
                     # 停止所有服务
@@ -1846,12 +2005,15 @@ case $MAIN_ACTION in
                     rm -f /etc/systemd/system/port-forward.service
                     rm -f /etc/systemd/system/gost-forward.service
                     rm -f /etc/systemd/system/realm-forward.service
+                    rm -f /etc/systemd/system/port-forward-restore.service
                     
                     # 删除配置文件
                     rm -rf /etc/realm /etc/gost
                     rm -f /etc/haproxy/haproxy.cfg /etc/rinetd.conf
                     rm -f /root/haproxy_credentials.txt /root/gost_credentials.txt
                     rm -f /root/.port_forward_iptables_running.txt
+                    rm -f /root/.port_forward_nftables_running.txt
+                    rm -rf /var/lib/port-forward
                     
                     # 清理nginx stream配置
                     if [ -d /etc/nginx/stream.d ]; then
@@ -1864,6 +2026,13 @@ case $MAIN_ACTION in
                         fi
                     fi
                     
+                    # 清理 nftables 规则
+                    if command -v nft >/dev/null 2>&1; then
+                        nft delete table inet port_forward 2>/dev/null || true
+                        rm -f /etc/nftables.d/port_forward.nft 2>/dev/null || true
+                        echo -e "${GREEN}✓ nftables 规则已清理${NC}"
+                    fi
+                    
                     # 清理iptables
                     IPTABLES_CMD=$(get_iptables_cmd)
                     $IPTABLES_CMD -t nat -S 2>/dev/null | grep "\-A.*DNAT" | sed 's/-A/-D/' | while read rule; do
@@ -1872,12 +2041,13 @@ case $MAIN_ACTION in
                     $IPTABLES_CMD -t nat -S 2>/dev/null | grep "\-A.*MASQUERADE" | sed 's/-A/-D/' | while read rule; do
                         $IPTABLES_CMD -t nat $rule 2>/dev/null || true
                     done
+                    echo -e "${GREEN}✓ iptables 规则已清理${NC}"
                     
                     # 删除二进制文件
                     rm -f /usr/local/bin/gost /usr/local/bin/realm
                     
                     # 删除脚本
-                    rm -f /usr/local/bin/pf
+                    rm -f /usr/local/bin/pf /usr/local/bin/port_forward.sh /usr/bin/pf
                     
                     systemctl daemon-reload
                     
@@ -1896,6 +2066,521 @@ case $MAIN_ACTION in
         else
             echo -e "${YELLOW}卸载已取消${NC}"
         fi
+        echo ""
+        echo -e "${YELLOW}按回车键返回主菜单...${NC}"
+        read
+        exec $0
+        ;;
+    7)
+        # 导入/导出配置
+        echo -e "${CYAN}${BOLD}=== 导入/导出配置 ===${NC}"
+        echo ""
+        echo "1) 导出当前配置"
+        echo "2) 导入配置文件"
+        echo "3) 查看备份文件"
+        echo "0) 返回主菜单"
+        echo ""
+        read -p "请选择 [0]: " EXPORT_CHOICE
+        EXPORT_CHOICE=${EXPORT_CHOICE:-0}
+        
+        case $EXPORT_CHOICE in
+            1)
+                # 导出配置
+                echo ""
+                echo -e "${CYAN}正在导出配置...${NC}"
+                
+                EXPORT_DIR="/var/lib/port-forward"
+                mkdir -p "$EXPORT_DIR"
+                EXPORT_FILE="$EXPORT_DIR/backup_$(date '+%Y%m%d_%H%M%S').json"
+                
+                # 构建导出数据
+                export_data='{"export_info":{},"forward_rules":[]}'
+                
+                # 添加导出信息
+                export_data=$(echo "$export_data" | jq \
+                    --arg version "$VERSION" \
+                    --arg export_time "$(date '+%Y-%m-%dT%H:%M:%S')" \
+                    --arg ipv4 "$(get_local_ip)" \
+                    '.export_info.version = $version | .export_info.export_time = $export_time | .export_info.source_ip = $ipv4')
+                
+                # 收集 nftables 规则
+                if command -v nft >/dev/null 2>&1; then
+                    nft_rules=$(nft list chain inet port_forward prerouting 2>/dev/null | grep -E "dnat ip6? to" || true)
+                    if [ -n "$nft_rules" ]; then
+                        while read -r line; do
+                            local_p=$(echo "$line" | grep -oE 'dport [0-9]+' | awk '{print $2}')
+                            if echo "$line" | grep -q "dnat ip6 to"; then
+                                target=$(echo "$line" | grep -oE 'dnat ip6 to \[[^\]]+\]:[0-9]+' | sed 's/dnat ip6 to //')
+                            else
+                                target=$(echo "$line" | grep -oE 'dnat ip to [0-9.]+:[0-9]+' | sed 's/dnat ip to //')
+                            fi
+                            if [ -n "$local_p" ] && [ -n "$target" ]; then
+                                target_ip=$(echo "$target" | sed 's/\[//;s/\]//;s/:[0-9]*$//')
+                                target_port=$(echo "$target" | grep -oE '[0-9]+$')
+                                export_data=$(echo "$export_data" | jq \
+                                    --arg type "nftables" \
+                                    --arg local_port "$local_p" \
+                                    --arg target_ip "$target_ip" \
+                                    --arg target_port "$target_port" \
+                                    '.forward_rules += [{"type":$type,"local_port":$local_port,"target_ip":$target_ip,"target_port":$target_port}]')
+                            fi
+                        done <<< "$nft_rules"
+                    fi
+                fi
+                
+                # 收集 iptables 规则
+                IPTABLES_CMD=$(get_iptables_cmd)
+                iptables_rules=$($IPTABLES_CMD -t nat -L PREROUTING -n 2>/dev/null | grep DNAT || true)
+                if [ -n "$iptables_rules" ]; then
+                    while read -r line; do
+                        local_p=$(echo "$line" | grep -oE 'dpt:[0-9]+' | cut -d: -f2)
+                        target=$(echo "$line" | grep -oE 'to:[0-9.]+:[0-9]+' | sed 's/to://')
+                        if [ -n "$local_p" ] && [ -n "$target" ]; then
+                            target_ip=$(echo "$target" | cut -d: -f1)
+                            target_port=$(echo "$target" | cut -d: -f2)
+                            export_data=$(echo "$export_data" | jq \
+                                --arg type "iptables" \
+                                --arg local_port "$local_p" \
+                                --arg target_ip "$target_ip" \
+                                --arg target_port "$target_port" \
+                                '.forward_rules += [{"type":$type,"local_port":$local_port,"target_ip":$target_ip,"target_port":$target_port}]')
+                        fi
+                    done <<< "$iptables_rules"
+                fi
+                
+                # 收集 realm 配置
+                if [ -f /etc/realm/config.toml ]; then
+                    while IFS= read -r listen_line; do
+                        local_p=$(echo "$listen_line" | grep -oE '[0-9]+$')
+                        read -r remote_line
+                        target=$(echo "$remote_line" | sed -n 's/.*remote = "\([^"]*\)".*/\1/p')
+                        if [ -n "$local_p" ] && [ -n "$target" ]; then
+                            if [[ "$target" =~ ^\[.*\]:[0-9]+$ ]]; then
+                                target_ip=$(echo "$target" | sed 's/\[\(.*\)\]:.*/\1/')
+                                target_port=$(echo "$target" | sed 's/.*\]://')
+                            else
+                                target_ip=$(echo "$target" | cut -d: -f1)
+                                target_port=$(echo "$target" | cut -d: -f2)
+                            fi
+                            export_data=$(echo "$export_data" | jq \
+                                --arg type "realm" \
+                                --arg local_port "$local_p" \
+                                --arg target_ip "$target_ip" \
+                                --arg target_port "$target_port" \
+                                '.forward_rules += [{"type":$type,"local_port":$local_port,"target_ip":$target_ip,"target_port":$target_port}]')
+                        fi
+                    done < <(grep -E "^listen|^remote" /etc/realm/config.toml 2>/dev/null)
+                fi
+                
+                # 收集 gost 配置
+                if [ -f /etc/gost/config.json ]; then
+                    export_data=$(echo "$export_data" | jq --slurpfile gost /etc/gost/config.json '.gost_config = $gost[0]')
+                fi
+                
+                # 收集 haproxy 配置
+                if [ -f /etc/haproxy/haproxy.cfg ]; then
+                    haproxy_content=$(cat /etc/haproxy/haproxy.cfg | base64 -w 0)
+                    export_data=$(echo "$export_data" | jq --arg cfg "$haproxy_content" '.haproxy_config = $cfg')
+                fi
+                
+                # 写入文件
+                echo "$export_data" | jq . > "$EXPORT_FILE"
+                
+                if [ -f "$EXPORT_FILE" ]; then
+                    file_size=$(stat -c%s "$EXPORT_FILE" 2>/dev/null || stat -f%z "$EXPORT_FILE" 2>/dev/null)
+                    rule_count=$(echo "$export_data" | jq '.forward_rules | length')
+                    echo ""
+                    echo -e "${GREEN}✓ 配置导出成功${NC}"
+                    echo -e "  文件路径: ${CYAN}$EXPORT_FILE${NC}"
+                    echo -e "  文件大小: ${file_size} 字节"
+                    echo -e "  规则数量: ${rule_count} 条"
+                    echo ""
+                    echo -e "${DIM}提示: 可使用 scp 下载此文件${NC}"
+                    echo -e "${DIM}示例: scp root@$(get_local_ip):$EXPORT_FILE ./backup.json${NC}"
+                else
+                    echo -e "${RED}导出失败${NC}"
+                fi
+                ;;
+            2)
+                # 导入配置
+                echo ""
+                
+                # 列出可用的备份文件
+                EXPORT_DIR="/var/lib/port-forward"
+                backup_files=()
+                if [ -d "$EXPORT_DIR" ]; then
+                    while IFS= read -r f; do
+                        [ -n "$f" ] && backup_files+=("$f")
+                    done < <(ls -t "$EXPORT_DIR"/backup_*.json 2>/dev/null)
+                fi
+                
+                if [ ${#backup_files[@]} -gt 0 ]; then
+                    echo -e "${CYAN}可用的备份文件:${NC}"
+                    i=1
+                    for f in "${backup_files[@]}"; do
+                        fname=$(basename "$f")
+                        fsize=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null)
+                        echo -e "  ${GREEN}$i)${NC} $fname (${fsize}B)"
+                        ((i++))
+                    done
+                    echo ""
+                fi
+                
+                echo -e "${DIM}输入备份文件路径，或输入序号选择上方文件${NC}"
+                read -p "文件路径: " import_path
+                
+                [ -z "$import_path" ] && { echo -e "${YELLOW}已取消${NC}"; exec $0; }
+                
+                # 如果输入的是数字，选择对应的备份文件
+                if [[ "$import_path" =~ ^[0-9]+$ ]] && [ "$import_path" -le ${#backup_files[@]} ]; then
+                    import_path="${backup_files[$((import_path-1))]}"
+                fi
+                
+                # 验证文件
+                if [ ! -f "$import_path" ]; then
+                    echo -e "${RED}文件不存在: $import_path${NC}"
+                    exec $0
+                fi
+                
+                if ! jq empty "$import_path" 2>/dev/null; then
+                    echo -e "${RED}无效的 JSON 格式${NC}"
+                    exec $0
+                fi
+                
+                # 显示配置信息
+                echo ""
+                echo -e "${CYAN}配置文件信息:${NC}"
+                export_version=$(jq -r '.export_info.version // "未知"' "$import_path")
+                export_time=$(jq -r '.export_info.export_time // "未知"' "$import_path")
+                source_ip=$(jq -r '.export_info.source_ip // "未知"' "$import_path")
+                rule_count=$(jq '.forward_rules | length' "$import_path")
+                
+                echo -e "  导出版本: $export_version"
+                echo -e "  导出时间: $export_time"
+                echo -e "  源服务器: $source_ip"
+                echo -e "  规则数量: ${GREEN}$rule_count${NC} 条"
+                echo ""
+                
+                # 显示规则列表
+                if [ "$rule_count" -gt 0 ]; then
+                    echo -e "${CYAN}转发规则:${NC}"
+                    jq -r '.forward_rules[] | "  \(.type): :\(.local_port) -> \(.target_ip):\(.target_port)"' "$import_path"
+                    echo ""
+                fi
+                
+                echo -e "${YELLOW}选择导入方式:${NC}"
+                echo "1) 使用 nftables 导入所有规则"
+                echo "2) 使用 iptables 导入所有规则"
+                echo "3) 使用 realm 导入所有规则"
+                echo "0) 取消"
+                echo ""
+                read -p "请选择 [1]: " import_method
+                import_method=${import_method:-1}
+                
+                case $import_method in
+                    1)
+                        # 使用 nftables 导入
+                        echo ""
+                        echo -e "${CYAN}使用 nftables 导入规则...${NC}"
+                        
+                        # 启用 IP 转发
+                        echo 1 > /proc/sys/net/ipv4/ip_forward
+                        grep -q "^net.ipv4.ip_forward = 1" /etc/sysctl.conf || echo "net.ipv4.ip_forward = 1" >> /etc/sysctl.conf
+                        
+                        # 创建 nftables 表和链
+                        nft add table inet port_forward 2>/dev/null || true
+                        nft add chain inet port_forward prerouting '{ type nat hook prerouting priority dstnat; policy accept; }' 2>/dev/null || true
+                        nft add chain inet port_forward postrouting '{ type nat hook postrouting priority srcnat; policy accept; }' 2>/dev/null || true
+                        
+                        # 导入规则
+                        jq -c '.forward_rules[]' "$import_path" | while read -r rule; do
+                            local_p=$(echo "$rule" | jq -r '.local_port')
+                            target_ip=$(echo "$rule" | jq -r '.target_ip')
+                            target_port=$(echo "$rule" | jq -r '.target_port')
+                            
+                            if [[ "$target_ip" =~ : ]]; then
+                                # IPv6
+                                nft add rule inet port_forward prerouting ip6 nexthdr tcp tcp dport "$local_p" counter dnat ip6 to "[$target_ip]:$target_port" 2>/dev/null
+                                nft add rule inet port_forward postrouting ip6 daddr "$target_ip" tcp dport "$target_port" counter masquerade 2>/dev/null
+                            else
+                                # IPv4
+                                nft add rule inet port_forward prerouting ip protocol tcp tcp dport "$local_p" counter dnat ip to "$target_ip:$target_port" 2>/dev/null
+                                nft add rule inet port_forward postrouting ip daddr "$target_ip" tcp dport "$target_port" counter masquerade 2>/dev/null
+                            fi
+                            echo -e "  ${GREEN}✓${NC} :$local_p -> $target_ip:$target_port"
+                        done
+                        
+                        # 保存规则
+                        mkdir -p /etc/nftables.d
+                        nft list table inet port_forward > /etc/nftables.d/port_forward.nft 2>/dev/null
+                        systemctl enable nftables 2>/dev/null || true
+                        
+                        echo ""
+                        echo -e "${GREEN}✓ 导入完成${NC}"
+                        ;;
+                    2)
+                        # 使用 iptables 导入
+                        echo ""
+                        echo -e "${CYAN}使用 iptables 导入规则...${NC}"
+                        
+                        IPTABLES_CMD=$(get_iptables_cmd)
+                        
+                        # 启用 IP 转发
+                        echo 1 > /proc/sys/net/ipv4/ip_forward
+                        grep -q "^net.ipv4.ip_forward = 1" /etc/sysctl.conf || echo "net.ipv4.ip_forward = 1" >> /etc/sysctl.conf
+                        
+                        # 导入规则
+                        jq -c '.forward_rules[]' "$import_path" | while read -r rule; do
+                            local_p=$(echo "$rule" | jq -r '.local_port')
+                            target_ip=$(echo "$rule" | jq -r '.target_ip')
+                            target_port=$(echo "$rule" | jq -r '.target_port')
+                            
+                            $IPTABLES_CMD -t nat -A PREROUTING -p tcp --dport "$local_p" -j DNAT --to-destination "$target_ip:$target_port" 2>/dev/null
+                            $IPTABLES_CMD -t nat -A POSTROUTING -p tcp -d "$target_ip" --dport "$target_port" -j MASQUERADE 2>/dev/null
+                            echo -e "  ${GREEN}✓${NC} :$local_p -> $target_ip:$target_port"
+                        done
+                        
+                        # 保存规则
+                        if [ -f /etc/debian_version ]; then
+                            netfilter-persistent save >/dev/null 2>&1
+                        elif [ -f /etc/redhat-release ]; then
+                            service iptables save >/dev/null 2>&1
+                        fi
+                        
+                        echo ""
+                        echo -e "${GREEN}✓ 导入完成${NC}"
+                        ;;
+                    3)
+                        # 使用 realm 导入
+                        echo ""
+                        echo -e "${CYAN}使用 realm 导入规则...${NC}"
+                        
+                        # 检查 realm 是否安装
+                        if ! command -v realm >/dev/null 2>&1; then
+                            echo -e "${YELLOW}正在安装 realm...${NC}"
+                            # 下载安装 realm
+                            ARCH=$(uname -m)
+                            case $ARCH in
+                                x86_64) REALM_ARCH="x86_64-unknown-linux-gnu" ;;
+                                aarch64) REALM_ARCH="aarch64-unknown-linux-gnu" ;;
+                                *) echo -e "${RED}不支持的架构: $ARCH${NC}"; exec $0 ;;
+                            esac
+                            REALM_URL="https://github.com/zhboner/realm/releases/latest/download/realm-${REALM_ARCH}.tar.gz"
+                            smart_download "$REALM_URL" "/tmp/realm.tar.gz" 30
+                            tar -xzf /tmp/realm.tar.gz -C /usr/local/bin/
+                            chmod +x /usr/local/bin/realm
+                            rm -f /tmp/realm.tar.gz
+                        fi
+                        
+                        # 生成配置
+                        mkdir -p /etc/realm
+                        cat > /etc/realm/config.toml << 'REALM_HEADER'
+[log]
+level = "warn"
+output = "/var/log/realm.log"
+
+[network]
+no_tcp = false
+use_udp = true
+
+REALM_HEADER
+                        
+                        jq -c '.forward_rules[]' "$import_path" | while read -r rule; do
+                            local_p=$(echo "$rule" | jq -r '.local_port')
+                            target_ip=$(echo "$rule" | jq -r '.target_ip')
+                            target_port=$(echo "$rule" | jq -r '.target_port')
+                            
+                            if [[ "$target_ip" =~ : ]]; then
+                                target="[$target_ip]:$target_port"
+                            else
+                                target="$target_ip:$target_port"
+                            fi
+                            
+                            cat >> /etc/realm/config.toml << EOF
+
+[[endpoints]]
+listen = "0.0.0.0:$local_p"
+remote = "$target"
+EOF
+                            echo -e "  ${GREEN}✓${NC} :$local_p -> $target"
+                        done
+                        
+                        # 创建服务
+                        cat > /etc/systemd/system/realm-forward.service << 'EOF'
+[Unit]
+Description=Realm Port Forward
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/realm -c /etc/realm/config.toml
+Restart=always
+RestartSec=3
+LimitNOFILE=51200
+
+[Install]
+WantedBy=multi-user.target
+EOF
+                        
+                        systemctl daemon-reload
+                        systemctl enable realm-forward
+                        systemctl restart realm-forward
+                        
+                        echo ""
+                        echo -e "${GREEN}✓ 导入完成${NC}"
+                        ;;
+                    *)
+                        echo -e "${YELLOW}已取消${NC}"
+                        ;;
+                esac
+                ;;
+            3)
+                # 查看备份文件
+                echo ""
+                echo -e "${CYAN}${BOLD}=== 备份文件列表 ===${NC}"
+                echo ""
+                BACKUP_BASE_DIR="/root/.port_forward_backups"
+                EXPORT_DIR="/var/lib/port-forward"
+                
+                # 收集所有备份文件
+                backup_list=()
+                backup_types=()
+                
+                # 收集配置备份
+                if [ -d "$BACKUP_BASE_DIR" ]; then
+                    while IFS= read -r backup; do
+                        [ -n "$backup" ] && backup_list+=("$backup") && backup_types+=("config")
+                    done < <(ls -dt "$BACKUP_BASE_DIR"/* 2>/dev/null | head -10)
+                fi
+                
+                # 收集导出文件
+                if [ -d "$EXPORT_DIR" ]; then
+                    while IFS= read -r f; do
+                        [ -n "$f" ] && backup_list+=("$f") && backup_types+=("export")
+                    done < <(ls -t "$EXPORT_DIR"/backup_*.json 2>/dev/null | head -10)
+                fi
+                
+                if [ ${#backup_list[@]} -eq 0 ]; then
+                    echo -e "${YELLOW}没有找到备份文件${NC}"
+                else
+                    echo -e "${CYAN}可用备份:${NC}"
+                    i=1
+                    for idx in "${!backup_list[@]}"; do
+                        f="${backup_list[$idx]}"
+                        t="${backup_types[$idx]}"
+                        if [ "$t" = "config" ]; then
+                            timestamp=$(basename "$f")
+                            size=$(du -sh "$f" 2>/dev/null | awk '{print $1}')
+                            # 尝试读取备份信息
+                            info=""
+                            if [ -f "$f/method" ]; then
+                                method=$(cat "$f/method" 2>/dev/null)
+                                info=" [$method]"
+                            fi
+                            echo -e "  ${GREEN}$i)${NC} $timestamp (${size})${info} ${DIM}[配置备份]${NC}"
+                        else
+                            fname=$(basename "$f")
+                            fsize=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null)
+                            # 读取规则数量
+                            rule_count=$(jq '.forward_rules | length' "$f" 2>/dev/null || echo "?")
+                            echo -e "  ${GREEN}$i)${NC} $fname (${fsize}B) ${DIM}[$rule_count 条规则]${NC}"
+                        fi
+                        ((i++))
+                    done
+                    echo ""
+                    echo -e "  ${GREEN}0)${NC} 返回"
+                    echo ""
+                    read -p "$(echo -e ${YELLOW}输入序号查看详情 [0]: ${NC})" view_choice
+                    view_choice=${view_choice:-0}
+                    
+                    if [[ "$view_choice" =~ ^[0-9]+$ ]] && [ "$view_choice" -gt 0 ] && [ "$view_choice" -le ${#backup_list[@]} ]; then
+                        selected="${backup_list[$((view_choice-1))]}"
+                        selected_type="${backup_types[$((view_choice-1))]}"
+                        echo ""
+                        echo -e "${CYAN}${BOLD}=== 备份详情 ===${NC}"
+                        echo -e "路径: ${selected}"
+                        echo ""
+                        
+                        if [ "$selected_type" = "export" ]; then
+                            # JSON 导出文件
+                            echo -e "${CYAN}导出信息:${NC}"
+                            jq -r '.export_info | "  时间: \(.export_time)\n  版本: \(.version)\n  来源IP: \(.source_ip)"' "$selected" 2>/dev/null
+                            echo ""
+                            echo -e "${CYAN}转发规则:${NC}"
+                            jq -r '.forward_rules[] | "  \(.type): :\(.local_port) -> \(.target_ip):\(.target_port)"' "$selected" 2>/dev/null
+                        else
+                            # 配置备份目录
+                            echo -e "${CYAN}转发配置:${NC}"
+                            
+                            # 优先读取 backup_info.txt
+                            if [ -f "$selected/backup_info.txt" ]; then
+                                cat "$selected/backup_info.txt" | while read line; do
+                                    echo -e "  $line"
+                                done
+                            else
+                                # 兼容旧格式
+                                [ -f "$selected/method" ] && echo -e "  转发类型: $(cat "$selected/method")"
+                                [ -f "$selected/target_ip" ] && echo -e "  目标IP: $(cat "$selected/target_ip")"
+                                if [ -f "$selected/ports" ]; then
+                                    echo -e "  端口映射:"
+                                    cat "$selected/ports" | while read line; do
+                                        [ -n "$line" ] && echo -e "    $line"
+                                    done
+                                fi
+                            fi
+                            
+                            # 显示具体配置文件内容
+                            echo ""
+                            if [ -f "$selected/iptables_backup.txt" ]; then
+                                # 只显示 NAT 相关规则
+                                nat_rules=$(grep -E "DNAT|MASQUERADE|SNAT" "$selected/iptables_backup.txt" 2>/dev/null | head -10)
+                                if [ -n "$nat_rules" ]; then
+                                    echo -e "${CYAN}iptables NAT 规则:${NC}"
+                                    echo "$nat_rules" | while read line; do
+                                        echo -e "  $line"
+                                    done
+                                fi
+                            fi
+                            if [ -f "$selected/nftables_rules.txt" ]; then
+                                echo -e "${CYAN}nftables 规则:${NC}"
+                                cat "$selected/nftables_rules.txt" | head -20 | while read line; do
+                                    echo -e "  $line"
+                                done
+                            fi
+                            if [ -f "$selected/haproxy.cfg" ]; then
+                                echo -e "${CYAN}HAProxy 配置:${NC}"
+                                cat "$selected/haproxy.cfg" | head -30 | while read line; do
+                                    echo -e "  $line"
+                                done
+                            fi
+                            if [ -f "$selected/realm_config.toml" ]; then
+                                echo -e "${CYAN}Realm 配置:${NC}"
+                                cat "$selected/realm_config.toml" | head -20 | while read line; do
+                                    echo -e "  $line"
+                                done
+                            fi
+                            if [ -f "$selected/gost_config.json" ]; then
+                                echo -e "${CYAN}Gost 配置:${NC}"
+                                cat "$selected/gost_config.json" | head -20 | while read line; do
+                                    echo -e "  $line"
+                                done
+                            fi
+                        fi
+                    fi
+                fi
+                
+                echo ""
+                # 显示 iptables/nftables 规则备份
+                echo -e "${CYAN}规则备份文件:${NC}"
+                [ -f /root/.port_forward_iptables_running.txt ] && echo -e "  iptables: /root/.port_forward_iptables_running.txt"
+                [ -f /root/.port_forward_nftables_running.txt ] && echo -e "  nftables: /root/.port_forward_nftables_running.txt"
+                [ -f /etc/nftables.d/port_forward.nft ] && echo -e "  nftables: /etc/nftables.d/port_forward.nft"
+                [ -f /etc/iptables/rules.v4 ] && echo -e "  iptables: /etc/iptables/rules.v4"
+                ;;
+            *)
+                ;;
+        esac
+        
         echo ""
         echo -e "${YELLOW}按回车键返回主菜单...${NC}"
         read
@@ -2574,10 +3259,19 @@ case $FORWARD_METHOD in
             echo -e "${GREEN}✓ CentOS 规则已保存${NC}"
         fi
         
-        # 备份规则
+        # 备份规则到固定位置（供开机恢复使用）
+        IPTABLES_RUNNING_BACKUP="/root/.port_forward_iptables_running.txt"
         if command -v iptables-save >/dev/null 2>&1; then
+            if [[ "$IPTABLES_CMD" == "iptables-legacy" ]]; then
+                iptables-legacy-save > "$IPTABLES_RUNNING_BACKUP" 2>/dev/null || true
+            else
+                iptables-save > "$IPTABLES_RUNNING_BACKUP" 2>/dev/null || true
+            fi
             iptables-save > "$BACKUP_DIR/iptables_current.txt" 2>/dev/null || true
         fi
+        
+        # 设置开机自启
+        setup_autostart "iptables"
         
         echo ""
         echo -e "${GREEN}${BOLD}===========================================${NC}"
@@ -2589,6 +3283,7 @@ case $FORWARD_METHOD in
             target_p=$(echo "$mapping" | cut -d: -f2)
             echo -e "  :$local_p -> $TARGET_IP:$target_p"
         done
+        echo -e "${GREEN}✓ 已设置开机自启${NC}"
         echo -e "${GREEN}${BOLD}===========================================${NC}"
         ;;
         
@@ -2695,6 +3390,9 @@ case $FORWARD_METHOD in
         
         echo -e "${GREEN}✓ 完成${NC}"
         
+        # 设置开机自启
+        setup_autostart "nftables"
+        
         echo ""
         echo -e "${GREEN}${BOLD}===========================================${NC}"
         echo -e "${GREEN}${BOLD}  nftables DNAT 配置完成！${NC}"
@@ -2707,6 +3405,7 @@ case $FORWARD_METHOD in
         done
         echo -e "${YELLOW}查看规则: nft list table inet port_forward${NC}"
         echo -e "${YELLOW}流量统计: 选择菜单选项 6${NC}"
+        echo -e "${GREEN}✓ 已设置开机自启${NC}"
         echo -e "${GREEN}${BOLD}===========================================${NC}"
         ;;
         
