@@ -28,14 +28,15 @@ Linux 端口转发管理工具，支持 8 种转发方案，自动安装依赖�
 |------|------|
 | Debian 10/11/12 | ✅ 完全支持 |
 | Ubuntu 20.04/22.04/24.04 | ✅ 完全支持 |
-| CentOS 7/8 | ⚠️ 基本支持 |
+| CentOS 7/8/9 | ✅ 完全支持 |
+| Alpine Linux | ✅ 完全支持 |
 
 ## 安装
 
 ### 一键安装 (推荐)
 
 ```bash
-bash <(curl -sL https://raw.githubusercontent.com/Chil30/port-forward/main/port_forward.sh)
+wget -O pof.sh https://raw.githubusercontent.com/Chil30/port-forward/main/port_forward.sh && chmod +x pof.sh && ./pof.sh
 ```
 
 ### 国内加速安装
@@ -44,19 +45,19 @@ bash <(curl -sL https://raw.githubusercontent.com/Chil30/port-forward/main/port_
 
 ```bash
 # 方式1: ghproxy 代理
-bash <(curl -sL https://ghproxy.com/https://raw.githubusercontent.com/Chil30/port-forward/main/port_forward.sh)
+wget -O pof.sh https://ghproxy.com/https://raw.githubusercontent.com/Chil30/port-forward/main/port_forward.sh && chmod +x pof.sh && ./pof.sh
 
 # 方式2: mirror.ghproxy 镜像
-bash <(curl -sL https://mirror.ghproxy.com/https://raw.githubusercontent.com/Chil30/port-forward/main/port_forward.sh)
+wget -O pof.sh https://mirror.ghproxy.com/https://raw.githubusercontent.com/Chil30/port-forward/main/port_forward.sh && chmod +x pof.sh && ./pof.sh
 
 # 方式3: gh.ddlc 代理
-bash <(curl -sL https://gh.ddlc.top/https://raw.githubusercontent.com/Chil30/port-forward/main/port_forward.sh)
+wget -O pof.sh https://gh.ddlc.top/https://raw.githubusercontent.com/Chil30/port-forward/main/port_forward.sh && chmod +x pof.sh && ./pof.sh
 
 # 方式4: moeyy 代理
-bash <(curl -sL https://github.moeyy.xyz/https://raw.githubusercontent.com/Chil30/port-forward/main/port_forward.sh)
+wget -O pof.sh https://github.moeyy.xyz/https://raw.githubusercontent.com/Chil30/port-forward/main/port_forward.sh && chmod +x pof.sh && ./pof.sh
 
 # 方式5: gh-proxy 代理
-bash <(curl -sL https://gh-proxy.com/https://raw.githubusercontent.com/Chil30/port-forward/main/port_forward.sh)
+wget -O pof.sh https://gh-proxy.com/https://raw.githubusercontent.com/Chil30/port-forward/main/port_forward.sh && chmod +x pof.sh && ./pof.sh
 ```
 
 ### 手动安装 (详细步骤)
@@ -110,9 +111,9 @@ sudo ./port_forward.sh
 
 #### 步骤 4: 安装快捷命令 (可选)
 
-首次运行会自动安装快捷命令 `pf`，之后可以直接使用：
+首次运行会自动安装快捷命令 `pof`，之后可以直接使用：
 ```bash
-pf
+pof
 ```
 
 如果快捷命令未自动安装，可以手动创建：
@@ -122,7 +123,7 @@ cp port_forward.sh /usr/local/bin/port_forward.sh
 chmod +x /usr/local/bin/port_forward.sh
 
 # 创建快捷命令
-ln -sf /usr/local/bin/port_forward.sh /usr/local/bin/pf
+ln -sf /usr/local/bin/port_forward.sh /usr/local/bin/pof
 ```
 
 ### 依赖软件手动安装
@@ -177,7 +178,7 @@ apt install -y iptables nftables haproxy socat rinetd nginx
 yum install -y iptables nftables haproxy socat rinetd nginx
 ```
 
-首次运行自动安装快捷命令 `pf`。
+首次运行自动安装快捷命令 `pof`。
 
 ## 使用方法
 
@@ -237,14 +238,14 @@ ssh root@server "pof -m nft 3389:1.2.3.4:3389"
 #### 启动工具
 
 ```bash
-pf
+pof
 ```
 
 ### 主菜单
 
 ```
 ============================================================================
-                      端口转发管理工具 v1.0.2
+                      端口转发管理工具 v1.0.5
 ============================================================================
   状态: 运行中    转发规则: 5 条
 ============================================================================
@@ -295,10 +296,10 @@ pf
 **多目标配置（多次运行）：**
 ```bash
 # 第一次：配置目标 A
-pf → 192.168.1.100 → 80,443
+pof → 192.168.1.100 → 80,443
 
 # 第二次：配置目标 B（规则累加）
-pf → 10.0.0.50 → 3389
+pof → 10.0.0.50 → 3389
 
 # 结果：
 # :80 → 192.168.1.100:80
@@ -347,7 +348,7 @@ pf → 10.0.0.50 → 3389
 
 | 文件 | 路径 |
 |------|------|
-| 脚本命令 | `/usr/local/bin/pf` |
+| 脚本命令 | `/usr/local/bin/pof` |
 | 配置备份 | `/root/.port_forward_backups/` |
 | nftables 配置 | `/etc/nftables.d/port_forward.nft` |
 | realm 配置 | `/etc/realm/config.toml` |

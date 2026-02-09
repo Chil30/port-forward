@@ -14,7 +14,7 @@
 #═══════════════════════════════════════════════════════════════════════════════
 #  常量定义
 #═══════════════════════════════════════════════════════════════════════════════
-readonly VERSION="1.0.4"
+readonly VERSION="1.0.5"
 readonly AUTHOR="Chli30"
 readonly GITHUB_URL="https://github.com/Chil30/port-forward"
 
@@ -126,6 +126,83 @@ GITHUB_MIRRORS=(
 #  网络工具函数
 #  说明: 智能下载、远程脚本执行、API 请求等网络操作封装
 #═══════════════════════════════════════════════════════════════════════════════
+
+# 检测脚本路径并设置 SCRIPT_PATH
+# 用于解决通过 bash <(curl ...) 运行时 exec $0 失败的问题
+detect_script_path() {
+    # 如果 $0 是一个可执行的常规文件，直接使用
+    if [[ -f "$0" && -x "$0" && ! "$0" =~ ^/dev/fd/ && ! "$0" =~ ^/proc/ ]]; then
+        SCRIPT_PATH="$0"
+        return 0
+    fi
+    
+    # 检查快捷命令是否存在
+    if [[ -x "/usr/local/bin/$SHORTCUT_CMD" ]]; then
+        SCRIPT_PATH="/usr/local/bin/$SHORTCUT_CMD"
+        return 0
+    fi
+    
+    # 检查其他可能的安装路径
+    for path in "/usr/local/bin/port_forward.sh" "/usr/bin/$SHORTCUT_CMD" "/usr/bin/port_forward.sh"; do
+        if [[ -x "$path" ]]; then
+            SCRIPT_PATH="$path"
+            return 0
+        fi
+    done
+    
+    # 通过进程替换运行，尝试保存脚本到本地
+    if [[ "$0" =~ ^/dev/fd/ || "$0" =~ ^/proc/ ]]; then
+        # 脚本正在通过进程替换运行，无法直接 exec $0
+        # 需要在脚本初始化时处理（见 ensure_script_installed 函数）
+        SCRIPT_PATH=""
+        return 1
+    fi
+    
+    SCRIPT_PATH=""
+    return 1
+}
+
+# 确保脚本已安装到本地 (用于支持 exec 重启)
+# 在脚本开始时调用一次
+ensure_script_installed() {
+    detect_script_path
+    
+    # 如果脚本已安装，无需处理
+    if [[ -n "$SCRIPT_PATH" && -x "$SCRIPT_PATH" ]]; then
+        return 0
+    fi
+    
+    # 尝试将当前脚本内容保存到本地
+    local install_path="/usr/local/bin/$SHORTCUT_CMD"
+    
+    # 如果我们在这里，说明是通过进程替换运行的
+    # 尝试从 stdin 读取（这在 bash <(curl ...) 场景下不可行）
+    # 所以我们设置标志，让菜单使用 while 循环而不是 exec
+    SCRIPT_PATH=""
+    USE_LOOP_MENU=true
+    return 1
+}
+
+# 返回主菜单 - 替代 exec $0
+# 解决通过 bash <(curl ...) 运行时 exec $0 失败的问题
+return_to_main_menu() {
+    # 如果有有效的脚本路径，使用 exec 重启
+    if [[ -n "$SCRIPT_PATH" && -x "$SCRIPT_PATH" ]]; then
+        exec "$SCRIPT_PATH"
+    fi
+    
+    # 没有有效路径时，设置标志让主循环继续
+    # 这种情况下不能真正重启脚本，只能继续当前循环
+    RETURN_TO_MENU=true
+    return 0
+}
+
+# 初始化脚本路径检测
+SCRIPT_PATH=""
+USE_LOOP_MENU=false
+RETURN_TO_MENU=false
+ensure_script_installed
+
 
 # 智能下载 - 自动尝试多个镜像源
 # 用法: smart_download <URL> <保存路径> [超时秒数]
@@ -359,6 +436,41 @@ generate_password() {
     tr -dc 'A-Za-z0-9!@#$%^&*' < /dev/urandom | head -c "$length" 2>/dev/null || \
     openssl rand -base64 "$length" 2>/dev/null | tr -dc 'A-Za-z0-9' | head -c "$length" || \
     date +%s%N | sha256sum | head -c "$length"
+}
+
+# 确保 jq 已安装
+# 用法: ensure_jq_installed
+# 返回: 0=已安装或安装成功, 1=安装失败
+ensure_jq_installed() {
+    # 检查 jq 是否已安装
+    if command -v jq >/dev/null 2>&1; then
+        return 0
+    fi
+    
+    echo -e "${YELLOW}jq 未安装，正在尝试安装...${NC}"
+    
+    # 检测包管理器并安装
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -qq >/dev/null 2>&1
+        apt-get install -y -qq jq >/dev/null 2>&1
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y -q jq >/dev/null 2>&1
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y -q jq >/dev/null 2>&1
+    elif command -v apk >/dev/null 2>&1; then
+        apk add --quiet jq >/dev/null 2>&1
+    elif command -v pacman >/dev/null 2>&1; then
+        pacman -S --noconfirm --quiet jq >/dev/null 2>&1
+    fi
+    
+    # 再次检查是否安装成功
+    if command -v jq >/dev/null 2>&1; then
+        echo -e "${GREEN}✓ jq 安装成功${NC}"
+        return 0
+    else
+        echo -e "${RED}✗ jq 安装失败，请手动安装: apt install jq / yum install jq${NC}"
+        return 1
+    fi
 }
 
 #═══════════════════════════════════════════════════════════════════════════════
@@ -996,7 +1108,7 @@ cli_forward_mode() {
                 result=$?
                 ;;
             3)  # socat
-                command -v socat >/dev/null 2>&1 || apt-get install -y socat >/dev/null 2>&1 || yum install -y socat >/dev/null 2>&1
+                command -v socat >/dev/null 2>&1 || apt-get install -y socat >/dev/null 2>&1 || yum install -y socat >/dev/null 2>&1 || apk add socat >/dev/null 2>&1
                 local proto_upper=$(echo "$protocol" | tr '[:lower:]' '[:upper:]')
                 [ "$protocol" = "both" ] && proto_upper="TCP"  # socat 一次只能转发一种协议
                 
@@ -1099,7 +1211,7 @@ EOF
                 result=0
                 ;;
             7)  # rinetd
-                command -v rinetd >/dev/null 2>&1 || apt-get install -y rinetd >/dev/null 2>&1 || yum install -y rinetd >/dev/null 2>&1
+                command -v rinetd >/dev/null 2>&1 || apt-get install -y rinetd >/dev/null 2>&1 || yum install -y rinetd >/dev/null 2>&1 || apk add rinetd >/dev/null 2>&1
                 echo "0.0.0.0 ${local_port} ${target_ip} ${target_port}" >> /etc/rinetd.conf
                 result=0
                 ;;
@@ -2010,7 +2122,7 @@ case $MAIN_ACTION in
         echo "==========================================="
         echo "按回车键返回主菜单..."
         read
-        exec $0
+        return_to_main_menu
         ;;
         
     #───────────────────────────────────────────────────────────────────────────
@@ -2152,7 +2264,7 @@ case $MAIN_ACTION in
                 fi
                 ;;
             0)
-                exec $0
+                return_to_main_menu
                 ;;
             *)
                 echo "无效选择"
@@ -2161,7 +2273,7 @@ case $MAIN_ACTION in
         echo ""
         echo "按回车键返回主菜单..."
         read
-        exec $0
+        return_to_main_menu
         ;;
         
     #───────────────────────────────────────────────────────────────────────────
@@ -2300,7 +2412,7 @@ case $MAIN_ACTION in
                 echo -e "${GREEN}✓ 所有转发服务已停止${NC}"
                 ;;
             0)
-                exec $0
+                return_to_main_menu
                 ;;
             *)
                 echo -e "${RED}无效选择${NC}"
@@ -2538,7 +2650,7 @@ case $MAIN_ACTION in
                         done
                         ;;
                     0)
-                        exec $0
+                        return_to_main_menu
                         ;;
                     *)
                         echo -e "${RED}无效选择${NC}"
@@ -2549,7 +2661,7 @@ case $MAIN_ACTION in
         echo ""
         echo -e "${YELLOW}按回车键返回主菜单...${NC}"
         read
-        exec $0
+        return_to_main_menu
         ;;
         
     #───────────────────────────────────────────────────────────────────────────
@@ -2724,17 +2836,33 @@ case $MAIN_ACTION in
         
         # 连接跟踪统计
         echo -e "${CYAN}${BOLD}=== 连接跟踪统计 ===${NC}"
+        CONNTRACK_FILE=""
+        CONNTRACK_DATA=""
+        
+        # 尝试多个连接跟踪数据源
         if [ -f /proc/net/nf_conntrack ]; then
-            TOTAL_CONN=$(cat /proc/net/nf_conntrack 2>/dev/null | wc -l)
-            ESTABLISHED=$(cat /proc/net/nf_conntrack 2>/dev/null | grep -c ESTABLISHED)
-            SYN_SENT=$(cat /proc/net/nf_conntrack 2>/dev/null | grep -c SYN_SENT)
-            TIME_WAIT=$(cat /proc/net/nf_conntrack 2>/dev/null | grep -c TIME_WAIT)
+            CONNTRACK_FILE="/proc/net/nf_conntrack"
+            CONNTRACK_DATA=$(cat "$CONNTRACK_FILE" 2>/dev/null)
+        elif [ -f /proc/net/ip_conntrack ]; then
+            CONNTRACK_FILE="/proc/net/ip_conntrack"
+            CONNTRACK_DATA=$(cat "$CONNTRACK_FILE" 2>/dev/null)
+        elif command -v conntrack >/dev/null 2>&1; then
+            # 尝试使用 conntrack 命令
+            CONNTRACK_DATA=$(conntrack -L 2>/dev/null)
+        fi
+        
+        if [ -n "$CONNTRACK_DATA" ]; then
+            TOTAL_CONN=$(echo "$CONNTRACK_DATA" | wc -l)
+            ESTABLISHED=$(echo "$CONNTRACK_DATA" | grep -c ESTABLISHED)
+            SYN_SENT=$(echo "$CONNTRACK_DATA" | grep -c SYN_SENT)
+            TIME_WAIT=$(echo "$CONNTRACK_DATA" | grep -c TIME_WAIT)
             echo -e "  总连接数: ${GREEN}${TOTAL_CONN}${NC}"
             echo -e "  ESTABLISHED: ${GREEN}${ESTABLISHED}${NC}"
             echo -e "  SYN_SENT: ${YELLOW}${SYN_SENT}${NC}"
             echo -e "  TIME_WAIT: ${CYAN}${TIME_WAIT}${NC}"
         else
             echo -e "  ${DIM}连接跟踪信息不可用${NC}"
+            echo -e "  ${DIM}提示: 可能需要加载模块: modprobe nf_conntrack${NC}"
         fi
         
         # 网络接口流量
@@ -2754,7 +2882,7 @@ case $MAIN_ACTION in
         echo ""
         echo "按回车键返回主菜单..."
         read
-        exec $0
+        return_to_main_menu
         ;;
         
     #───────────────────────────────────────────────────────────────────────────
@@ -2779,7 +2907,7 @@ case $MAIN_ACTION in
         UNINSTALL_CHOICE=${UNINSTALL_CHOICE:-0}
         
         if [ "$UNINSTALL_CHOICE" = "0" ]; then
-            exec $0
+            return_to_main_menu
         fi
         
         echo -e "${RED}警告：此操作将卸载选定的服务！${NC}"
@@ -2947,7 +3075,7 @@ case $MAIN_ACTION in
         echo ""
         echo -e "${YELLOW}按回车键返回主菜单...${NC}"
         read
-        exec $0
+        return_to_main_menu
         ;;
         
     #───────────────────────────────────────────────────────────────────────────
@@ -2980,6 +3108,15 @@ case $MAIN_ACTION in
                 
                 echo ""
                 echo -e "${CYAN}正在收集配置...${NC}"
+                
+                # 检查并安装 jq 依赖
+                if ! ensure_jq_installed; then
+                    echo -e "${RED}导出功能需要 jq 工具，请先安装后再试${NC}"
+                    echo ""
+                    echo "按回车键返回主菜单..."
+                    read
+                    return_to_main_menu
+                fi
                 
                 EXPORT_DIR="/var/lib/port-forward"
                 mkdir -p "$EXPORT_DIR"
@@ -3298,7 +3435,7 @@ case $MAIN_ACTION in
                         echo -e "${DIM}输入备份文件路径，或输入序号选择上方文件${NC}"
                         read -p "文件路径: " import_input
                         
-                        [ -z "$import_input" ] && { echo -e "${YELLOW}已取消${NC}"; exec $0; }
+                        [ -z "$import_input" ] && { echo -e "${YELLOW}已取消${NC}"; return_to_main_menu; }
                         
                         # 如果输入的是数字，选择对应的备份文件
                         if [[ "$import_input" =~ ^[0-9]+$ ]] && [ "$import_input" -le ${#backup_files[@]} ]; then
@@ -3311,7 +3448,7 @@ case $MAIN_ACTION in
                         # 从 URL 导入
                         echo ""
                         read -p "请输入配置文件 URL: " import_url
-                        [ -z "$import_url" ] && { echo -e "${YELLOW}已取消${NC}"; exec $0; }
+                        [ -z "$import_url" ] && { echo -e "${YELLOW}已取消${NC}"; return_to_main_menu; }
                         
                         echo -e "${CYAN}正在下载配置...${NC}"
                         import_path="/tmp/pf_import_$(date +%s).json"
@@ -3319,7 +3456,7 @@ case $MAIN_ACTION in
                             echo -e "${GREEN}✓ 下载成功${NC}"
                         else
                             echo -e "${RED}下载失败${NC}"
-                            exec $0
+                            return_to_main_menu
                         fi
                         ;;
                     3)
@@ -3332,21 +3469,21 @@ case $MAIN_ACTION in
                         ;;
                     *)
                         echo -e "${YELLOW}已取消${NC}"
-                        exec $0
+                        return_to_main_menu
                         ;;
                 esac
                 
-                [ -z "$import_path" ] && { echo -e "${YELLOW}已取消${NC}"; exec $0; }
+                [ -z "$import_path" ] && { echo -e "${YELLOW}已取消${NC}"; return_to_main_menu; }
                 
                 # 验证文件
                 if [ ! -f "$import_path" ]; then
                     echo -e "${RED}文件不存在: $import_path${NC}"
-                    exec $0
+                    return_to_main_menu
                 fi
                 
                 if ! jq empty "$import_path" 2>/dev/null; then
                     echo -e "${RED}无效的 JSON 格式${NC}"
-                    exec $0
+                    return_to_main_menu
                 fi
                 
                 # 显示配置信息
@@ -3465,7 +3602,7 @@ case $MAIN_ACTION in
                             case $ARCH in
                                 x86_64) REALM_ARCH="x86_64-unknown-linux-gnu" ;;
                                 aarch64) REALM_ARCH="aarch64-unknown-linux-gnu" ;;
-                                *) echo -e "${RED}不支持的架构: $ARCH${NC}"; exec $0 ;;
+                                *) echo -e "${RED}不支持的架构: $ARCH${NC}"; return_to_main_menu ;;
                             esac
                             REALM_URL="https://github.com/zhboner/realm/releases/latest/download/realm-${REALM_ARCH}.tar.gz"
                             smart_download "$REALM_URL" "/tmp/realm.tar.gz" 30
@@ -3720,7 +3857,7 @@ EOF
         echo ""
         echo -e "${YELLOW}按回车键返回主菜单...${NC}"
         read
-        exec $0
+        return_to_main_menu
         ;;
 esac
 
@@ -4928,7 +5065,9 @@ case $FORWARD_METHOD in
             if [ -f /etc/debian_version ]; then
                 apt-get update -qq && apt-get install -y nftables >/dev/null 2>&1
             elif [ -f /etc/redhat-release ]; then
-                yum install -y nftables >/dev/null 2>&1
+                yum install -y nftables >/dev/null 2>&1 || dnf install -y nftables >/dev/null 2>&1
+            elif [ -f /etc/alpine-release ]; then
+                apk add nftables >/dev/null 2>&1
             fi
         fi
         
@@ -5088,7 +5227,9 @@ case $FORWARD_METHOD in
             if [ -f /etc/debian_version ]; then
                 apt-get update -qq && apt-get install -y --no-install-recommends haproxy
             elif [ -f /etc/redhat-release ]; then
-                yum install -y haproxy
+                yum install -y haproxy || dnf install -y haproxy
+            elif [ -f /etc/alpine-release ]; then
+                apk add haproxy
             fi
         fi
         
@@ -5260,7 +5401,9 @@ EOF
             if [ -f /etc/debian_version ]; then
                 apt-get update -qq && apt-get install -y --no-install-recommends socat
             elif [ -f /etc/redhat-release ]; then
-                yum install -y socat
+                yum install -y socat || dnf install -y socat
+            elif [ -f /etc/alpine-release ]; then
+                apk add socat
             fi
         fi
         
@@ -5357,9 +5500,14 @@ EOF
                         echo -e "${GREEN}✅ 通过apt安装成功${NC}"
                     fi
                 elif [ -f /etc/redhat-release ]; then
-                    if yum install -y gost 2>/dev/null; then
+                    if yum install -y gost 2>/dev/null || dnf install -y gost 2>/dev/null; then
                         INSTALL_SUCCESS=true
-                        echo -e "${GREEN}✅ 通过yum安装成功${NC}"
+                        echo -e "${GREEN}✅ 通过yum/dnf安装成功${NC}"
+                    fi
+                elif [ -f /etc/alpine-release ]; then
+                    if apk add gost 2>/dev/null; then
+                        INSTALL_SUCCESS=true
+                        echo -e "${GREEN}✅ 通过apk安装成功${NC}"
                     fi
                 fi
             fi
@@ -5802,7 +5950,9 @@ EOF
             if [ -f /etc/debian_version ]; then
                 apt-get update -qq && apt-get install -y --no-install-recommends rinetd
             elif [ -f /etc/redhat-release ]; then
-                yum install -y rinetd
+                yum install -y rinetd || dnf install -y rinetd
+            elif [ -f /etc/alpine-release ]; then
+                apk add rinetd
             fi
         fi
         
@@ -5921,7 +6071,9 @@ EOF
                 apt-get install -y nginx-full
                 NGINX_ALREADY_RUNNING=false
             elif [ -f /etc/redhat-release ]; then
-                yum install -y nginx-mod-stream || yum install -y nginx
+                yum install -y nginx-mod-stream || yum install -y nginx || dnf install -y nginx
+            elif [ -f /etc/alpine-release ]; then
+                apk add nginx nginx-mod-stream >/dev/null 2>&1 || apk add nginx >/dev/null 2>&1
             fi
         fi
         
